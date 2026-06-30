@@ -34,6 +34,29 @@ if(ENABLE_QT)
   )
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c)
+# --- Added: OpenCV (core+imgproc) and libjpeg-turbo, statically linked -----
+# Configure with the vcpkg static triplet so these get baked into the
+# plugin DLL directly, e.g.:
+#   cmake --preset windows-x64 ^
+#     -DCMAKE_TOOLCHAIN_FILE=<vcpkg-root>/scripts/buildsystems/vcpkg.cmake ^
+#     -DVCPKG_TARGET_TRIPLET=x64-windows-static
+find_package(OpenCV REQUIRED COMPONENTS core imgproc)
+find_package(libjpeg-turbo CONFIG REQUIRED)
+
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_LIBS} libjpeg-turbo::turbojpeg-static)
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_INCLUDE_DIRS})
+
+# Match vcpkg's static triplet's CRT linkage (/MT) so there's no
+# RuntimeLibrary mismatch at link time, and so the installed plugin needs
+# no VC++ redistributable on the end user's machine.
+set_target_properties(
+  ${CMAKE_PROJECT_NAME}
+  PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+# ----------------------------------------------------------------------------
+
+# NOTE: replace src/plugin-main.c with your plugin source file and update
+# this line to match its filename.
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/udp_stream_filter.cpp)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

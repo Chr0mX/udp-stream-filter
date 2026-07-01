@@ -49,9 +49,16 @@ find_package(libjpeg-turbo CONFIG QUIET)
 if(libjpeg-turbo_FOUND)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE libjpeg-turbo::turbojpeg-static)
 else()
+  # Deliberately avoid pkg_check_modules(... IMPORTED_TARGET ...): it
+  # resolves to an absolute library path, and on some distros (e.g. Ubuntu)
+  # that resolves to a non-PIC static libturbojpeg.a, which fails to link
+  # into this shared module. Passing plain -L/-l flags instead lets the
+  # linker's own default search order prefer the shared library.
   find_package(PkgConfig REQUIRED)
-  pkg_check_modules(turbojpeg REQUIRED IMPORTED_TARGET libturbojpeg)
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE PkgConfig::turbojpeg)
+  pkg_check_modules(turbojpeg REQUIRED libturbojpeg)
+  target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${turbojpeg_INCLUDE_DIRS})
+  target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE ${turbojpeg_LIBRARY_DIRS})
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${turbojpeg_LIBRARIES})
 endif()
 
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_LIBS})

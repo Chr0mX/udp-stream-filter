@@ -34,33 +34,17 @@ if(ENABLE_QT)
   )
 endif()
 
-# --- Added: OpenCV (core+imgproc) and libjpeg-turbo, statically linked -----
+# --- Added: OpenCV (core+imgproc+imgcodecs), statically linked ------------
 # Configure with the vcpkg static triplet so these get baked into the
 # plugin DLL directly, e.g.:
 #   cmake --preset windows-x64 ^
 #     -DCMAKE_TOOLCHAIN_FILE=<vcpkg-root>/scripts/buildsystems/vcpkg.cmake ^
 #     -DVCPKG_TARGET_TRIPLET=x64-windows-static
-find_package(OpenCV REQUIRED COMPONENTS core imgproc)
-
-# vcpkg (Windows) exports a CMake config package for libjpeg-turbo; native
-# package managers (apt, Homebrew) generally only ship a pkg-config file, so
-# fall back to that when the CONFIG package isn't available.
-find_package(libjpeg-turbo CONFIG QUIET)
-if(libjpeg-turbo_FOUND)
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE libjpeg-turbo::turbojpeg-static)
-else()
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(turbojpeg REQUIRED IMPORTED_TARGET libturbojpeg)
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE PkgConfig::turbojpeg)
-endif()
-
-# On Linux, whichever branch above resolved can end up pointing at a
-# static libturbojpeg.a that isn't built with -fPIC (this is the case for
-# Ubuntu's libturbojpeg0-dev, which ships no shared library at all), which
-# fails to link into this shared module. Allow text relocations at link
-# time, the standard workaround for linking a non-PIC static lib into a
-# .so, unconditionally on Linux rather than only in the pkg-config branch.
-target_link_options(${CMAKE_PROJECT_NAME} PRIVATE $<$<PLATFORM_ID:Linux>:-Wl,-z,notext>)
+# JPEG encoding uses OpenCV's own imgcodecs (cv::imencode) rather than a
+# separate libjpeg-turbo dependency, since libjpeg-turbo is unreliable to
+# link across native package managers (e.g. Ubuntu's libturbojpeg0-dev is a
+# non-PIC static archive that cannot link into a shared module at all).
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_LIBS})
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_INCLUDE_DIRS})

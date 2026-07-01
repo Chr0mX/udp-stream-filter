@@ -4,8 +4,8 @@
 #include <util/platform.h>
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
-#include <turbojpeg.h>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -89,8 +89,6 @@ struct udp_stream_filter {
 	std::chrono::steady_clock::time_point last_send;
 	int frames_sent;
 	bool first_sent;
-
-	tjhandle tj;
 
 	std::thread enc_thread;
 	std::atomic<bool> enc_running{false};
@@ -304,24 +302,18 @@ static void encode_thread_func(udp_stream_filter *f)
 			frame_id = (uint32_t)f->frames_sent;
 		}
 
-		if (frame.empty() || !f->tj)
+		if (frame.empty())
 			continue;
 
-		unsigned char *jpeg_buf = nullptr;
-		unsigned long jpeg_size = 0;
+		std::vector<uchar> jpeg_buf;
+		std::vector<int> encode_params = {cv::IMWRITE_JPEG_QUALITY, f->jpeg_quality};
 
-		int ret = tjCompress2(f->tj, frame.data, frame.cols, (int)frame.step, frame.rows, TJPF_BGR, &jpeg_buf,
-				      &jpeg_size, TJSAMP_420, f->jpeg_quality, TJFLAG_FASTDCT);
-
-		if (ret == 0 && jpeg_buf && jpeg_size > 0) {
-			send_jpeg_chunked(f, jpeg_buf, jpeg_size, frame_id);
+		if (cv::imencode(".jpg", frame, jpeg_buf, encode_params) && !jpeg_buf.empty()) {
+			send_jpeg_chunked(f, jpeg_buf.data(), jpeg_buf.size(), frame_id);
 			f->frames_sent++;
 		} else {
 			blog(LOG_WARNING, "[xudp] JPEG compression failed");
 		}
-
-		if (jpeg_buf)
-			tjFree(jpeg_buf);
 	}
 }
 
@@ -442,10 +434,6 @@ static void *udp_stream_create(obs_data_t *settings, obs_source_t *source)
 	f->first_sent = false;
 	f->last_send = std::chrono::steady_clock::now();
 
-	f->tj = tjInitCompress();
-	if (!f->tj)
-		blog(LOG_ERROR, "[xudp] tjInitCompress failed");
-
 	f->enc_running = true;
 	f->enc_thread = std::thread(encode_thread_func, f);
 
@@ -462,9 +450,6 @@ static void udp_stream_destroy(void *data)
 	f->enc_cv.notify_all();
 	if (f->enc_thread.joinable())
 		f->enc_thread.join();
-
-	if (f->tj)
-		tjDestroy(f->tj);
 
 	if (f->sock != INVALID_SOCKET)
 		closesocket(f->sock);

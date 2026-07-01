@@ -41,9 +41,20 @@ endif()
 #     -DCMAKE_TOOLCHAIN_FILE=<vcpkg-root>/scripts/buildsystems/vcpkg.cmake ^
 #     -DVCPKG_TARGET_TRIPLET=x64-windows-static
 find_package(OpenCV REQUIRED COMPONENTS core imgproc)
-find_package(libjpeg-turbo CONFIG REQUIRED)
 
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_LIBS} libjpeg-turbo::turbojpeg-static)
+# vcpkg (Windows) exports a CMake config package for libjpeg-turbo; native
+# package managers (apt, Homebrew) generally only ship a pkg-config file, so
+# fall back to that when the CONFIG package isn't available.
+find_package(libjpeg-turbo CONFIG QUIET)
+if(libjpeg-turbo_FOUND)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE libjpeg-turbo::turbojpeg-static)
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(turbojpeg REQUIRED IMPORTED_TARGET libturbojpeg)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE PkgConfig::turbojpeg)
+endif()
+
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_LIBS})
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_INCLUDE_DIRS})
 
 # Match vcpkg's static triplet's CRT linkage (/MT) so there's no

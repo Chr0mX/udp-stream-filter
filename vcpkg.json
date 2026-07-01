@@ -1,5 +1,11 @@
 {
   "name": "udp-stream-filter",
   "version": "1.0.2",
-  "dependencies": ["opencv"]
+  "dependencies": [
+    {
+      "name": "opencv4",
+      "default-features": false,
+      "features": ["jpeg", "png"]
+    }
+  ]
 }

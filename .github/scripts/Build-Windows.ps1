@@ -47,6 +47,9 @@ function Build {
     Push-Location -Stack BuildTemp
     Ensure-Location $ProjectRoot
 
+    Log-Group "Installing vcpkg manifest dependencies..."
+    Invoke-External "$env:VCPKG_INSTALLATION_ROOT/vcpkg" install --triplet x64-windows-static --x-manifest-root=$ProjectRoot --x-install-root="${ProjectRoot}/vcpkg_installed"
+
     $CmakeArgs = @('--preset', "windows-ci-${Target}")
     $CmakeBuildArgs = @('--build')
     $CmakeInstallArgs = @()

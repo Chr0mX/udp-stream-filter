@@ -49,16 +49,18 @@ find_package(libjpeg-turbo CONFIG QUIET)
 if(libjpeg-turbo_FOUND)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE libjpeg-turbo::turbojpeg-static)
 else()
-  # Ubuntu's libturbojpeg0-dev only ships a static libturbojpeg.a (no shared
-  # library), and that archive isn't built with -fPIC, so it can't link
-  # cleanly into this shared module. Allow text relocations at link time
-  # (the standard workaround for linking a non-PIC static lib into a .so)
-  # instead of restructuring how the dependency is provisioned.
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(turbojpeg REQUIRED IMPORTED_TARGET libturbojpeg)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE PkgConfig::turbojpeg)
-  target_link_options(${CMAKE_PROJECT_NAME} PRIVATE $<$<PLATFORM_ID:Linux>:-Wl,-z,notext>)
 endif()
+
+# On Linux, whichever branch above resolved can end up pointing at a
+# static libturbojpeg.a that isn't built with -fPIC (this is the case for
+# Ubuntu's libturbojpeg0-dev, which ships no shared library at all), which
+# fails to link into this shared module. Allow text relocations at link
+# time, the standard workaround for linking a non-PIC static lib into a
+# .so, unconditionally on Linux rather than only in the pkg-config branch.
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE $<$<PLATFORM_ID:Linux>:-Wl,-z,notext>)
 
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_LIBS})
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_INCLUDE_DIRS})

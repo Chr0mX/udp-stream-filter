@@ -49,6 +49,7 @@ struct udp_stream_filter {
     int jpeg_quality;
     int max_fps;
     bool crop_zoom_output;
+    int output_preset;
     int fov;
     float zoom_level;
     int out_w;
@@ -467,6 +468,7 @@ static void udp_stream_get_defaults(obs_data_t *settings)
     obs_data_set_default_int(settings, "jpeg_quality", 80);
     obs_data_set_default_int(settings, "max_fps", 0);
     obs_data_set_default_bool(settings, "crop_zoom_output", false);
+    obs_data_set_default_int(settings, "output_preset", 0);
     obs_data_set_default_int(settings, "fov", 0);
     obs_data_set_default_double(settings, "zoom_level", 1.0);
     obs_data_set_default_int(settings, "out_w", 1920);
@@ -488,15 +490,29 @@ static void udp_stream_update(void *data, obs_data_t *settings)
 
     f->jpeg_quality = (int)obs_data_get_int(settings, "jpeg_quality");
     f->max_fps = (int)obs_data_get_int(settings, "max_fps");
-    f->crop_zoom_output = obs_data_get_bool(settings, "crop_zoom_output");
     f->fov = (int)obs_data_get_int(settings, "fov");
     f->zoom_level = (float)obs_data_get_double(settings, "zoom_level");
-    f->out_w = (int)obs_data_get_int(settings, "out_w");
-    f->out_h = (int)obs_data_get_int(settings, "out_h");
-    f->crop_mode = (int)obs_data_get_int(settings, "crop_mode");
     f->crop_off_x = (int)obs_data_get_int(settings, "crop_off_x");
     f->crop_off_y = (int)obs_data_get_int(settings, "crop_off_y");
-    f->keep_aspect = obs_data_get_bool(settings, "keep_aspect");
+
+    f->output_preset = (int)obs_data_get_int(settings, "output_preset");
+    int preset_size = f->output_preset == 1 ? 320 : f->output_preset == 2 ? 640 : 0;
+
+    if (preset_size > 0) {
+        // Presets force a square center-crop at the given size; zoom
+        // amount and crop offset remain user-adjustable.
+        f->crop_zoom_output = true;
+        f->out_w = preset_size;
+        f->out_h = preset_size;
+        f->crop_mode = 0;
+        f->keep_aspect = true;
+    } else {
+        f->crop_zoom_output = obs_data_get_bool(settings, "crop_zoom_output");
+        f->out_w = (int)obs_data_get_int(settings, "out_w");
+        f->out_h = (int)obs_data_get_int(settings, "out_h");
+        f->crop_mode = (int)obs_data_get_int(settings, "crop_mode");
+        f->keep_aspect = obs_data_get_bool(settings, "keep_aspect");
+    }
 
     bool ip_or_port_changed = (new_ip != f->target_ip) || (new_port != f->target_port);
     f->target_ip = new_ip;
@@ -510,9 +526,26 @@ static void udp_stream_update(void *data, obs_data_t *settings)
     }
 }
 
+// Grays out the manual size/crop-mode controls whenever a standard output
+// preset (320x320 / 640x640) is active, since their effective values are
+// then dictated by the preset rather than user input.
+static bool udp_stream_preset_modified(obs_properties_t *props, obs_property_t *property,
+                                        obs_data_t *settings)
+{
+    UNUSED_PARAMETER(property);
+    bool is_preset = obs_data_get_int(settings, "output_preset") != 0;
+
+    obs_property_set_enabled(obs_properties_get(props, "crop_zoom_output"), !is_preset);
+    obs_property_set_enabled(obs_properties_get(props, "out_w"), !is_preset);
+    obs_property_set_enabled(obs_properties_get(props, "out_h"), !is_preset);
+    obs_property_set_enabled(obs_properties_get(props, "crop_mode"), !is_preset);
+    obs_property_set_enabled(obs_properties_get(props, "keep_aspect"), !is_preset);
+
+    return true;
+}
+
 static obs_properties_t *udp_stream_get_properties(void *data)
 {
-    UNUSED_PARAMETER(data);
     obs_properties_t *props = obs_properties_create();
 
     obs_properties_add_bool(props, "udp_enabled", "Enable UDP Streaming");
@@ -520,6 +553,13 @@ static obs_properties_t *udp_stream_get_properties(void *data)
     obs_properties_add_int(props, "target_port", "Target Port", 1, 65535, 1);
     obs_properties_add_int_slider(props, "jpeg_quality", "JPEG Quality", 1, 100, 1);
     obs_properties_add_int(props, "max_fps", "Max FPS (0 = uncapped)", 0, 240, 1);
+
+    obs_property_t *preset_list = obs_properties_add_list(
+        props, "output_preset", "Output Preset", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(preset_list, "Custom", 0);
+    obs_property_list_add_int(preset_list, "320x320", 1);
+    obs_property_list_add_int(preset_list, "640x640", 2);
+    obs_property_set_modified_callback(preset_list, udp_stream_preset_modified);
 
     obs_properties_add_bool(props, "crop_zoom_output", "Enable Crop/Zoom");
     obs_properties_add_int(props, "fov", "Simulated FOV, deg (0 = use Zoom Level)", 0, 179, 1);
@@ -535,6 +575,13 @@ static obs_properties_t *udp_stream_get_properties(void *data)
     obs_properties_add_int(props, "crop_off_x", "Crop Offset X (px)", -7680, 7680, 1);
     obs_properties_add_int(props, "crop_off_y", "Crop Offset Y (px)", -4320, 4320, 1);
     obs_properties_add_bool(props, "keep_aspect", "Keep Aspect Ratio");
+
+    if (data) {
+        udp_stream_filter *f = (udp_stream_filter *)data;
+        obs_data_t *settings = obs_source_get_settings(f->source);
+        udp_stream_preset_modified(props, preset_list, settings);
+        obs_data_release(settings);
+    }
 
     return props;
 }

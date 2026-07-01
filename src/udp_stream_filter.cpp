@@ -309,7 +309,7 @@ static void encode_thread_func(udp_stream_filter *f)
 		std::vector<int> encode_params = {cv::IMWRITE_JPEG_QUALITY, f->jpeg_quality};
 
 		if (cv::imencode(".jpg", frame, jpeg_buf, encode_params) && !jpeg_buf.empty()) {
-			send_jpeg_chunked(f, jpeg_buf.data(), jpeg_buf.size(), frame_id);
+			send_jpeg_chunked(f, jpeg_buf.data(), (unsigned long)jpeg_buf.size(), frame_id);
 			f->frames_sent++;
 		} else {
 			blog(LOG_WARNING, "[xudp] JPEG compression failed");

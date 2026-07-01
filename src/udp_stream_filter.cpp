@@ -3,7 +3,8 @@
 #include <graphics/graphics.h>
 #include <util/platform.h>
 
-#include <opencv2/opencv.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #include <turbojpeg.h>
 
 #ifdef _WIN32
@@ -15,6 +16,22 @@
 #pragma comment(lib, "ws2_32.lib")
 #undef min
 #undef max
+#else
+#include <arpa/inet.h>
+#include <cerrno>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+typedef int SOCKET;
+static const SOCKET INVALID_SOCKET = -1;
+static const int SOCKET_ERROR = -1;
+#define closesocket(s) close(s)
+static int WSAGetLastError()
+{
+	return errno;
+}
 #endif
 
 #include <thread>
@@ -591,16 +608,20 @@ static obs_properties_t *udp_stream_get_properties(void *data)
 // Module entry points
 // ---------------------------------------------------------------------------
 
+#ifdef _WIN32
 static bool g_wsa_started = false;
+#endif
 
 bool obs_module_load(void)
 {
+#ifdef _WIN32
 	WSADATA wsa;
 	if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
 		g_wsa_started = true;
 	} else {
 		blog(LOG_ERROR, "[xudp] WSAStartup failed");
 	}
+#endif
 
 	struct obs_source_info udp_stream_filter_info = {};
 	udp_stream_filter_info.id = "udp_stream_filter";
@@ -620,6 +641,8 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+#ifdef _WIN32
 	if (g_wsa_started)
 		WSACleanup();
+#endif
 }

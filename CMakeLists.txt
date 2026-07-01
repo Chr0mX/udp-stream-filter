@@ -60,10 +60,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_INCLUDE_DIRS})
 # Match vcpkg's static triplet's CRT linkage (/MT) so there's no
 # RuntimeLibrary mismatch at link time, and so the installed plugin needs
 # no VC++ redistributable on the end user's machine.
-set_target_properties(
-  ${CMAKE_PROJECT_NAME}
-  PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
-)
+set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # ----------------------------------------------------------------------------
 
 # NOTE: replace src/plugin-main.c with your plugin source file and update

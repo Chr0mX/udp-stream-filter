@@ -108,6 +108,7 @@ runs:
         $PackageArgs = @{
           Target = '${{ inputs.target }}'
           Configuration = '${{ inputs.config }}'
+          Installer = [bool]::Parse('${{ inputs.package }}')
         }
 
         .github/scripts/Package-Windows.ps1 @PackageArgs

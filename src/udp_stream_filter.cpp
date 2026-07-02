@@ -44,11 +44,6 @@ static int WSAGetLastError()
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
-#include <cmath>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("xudp", "en-US")
@@ -65,16 +60,12 @@ struct udp_stream_filter {
 	int target_port;
 	int jpeg_quality;
 	int max_fps;
-	bool crop_zoom_output;
+	bool crop_enabled;
 	int output_preset;
-	int fov;
-	float zoom_level;
-	int out_w;
-	int out_h;
-	int crop_mode;
-	int crop_off_x;
-	int crop_off_y;
-	bool keep_aspect;
+	int crop_width;
+	int crop_height;
+	int crop_anchor_x;
+	int crop_anchor_y;
 
 	bool enable_color_boost;
 	bool boost_yellow;
@@ -99,91 +90,39 @@ struct udp_stream_filter {
 };
 
 // ---------------------------------------------------------------------------
-// Crop / zoom / FOV math
+// Native pixel crop (no resize/interpolation)
 // ---------------------------------------------------------------------------
 
-// Converts a "simulated FOV" in degrees into an equivalent zoom multiplier,
-// relative to an assumed baseline FOV (90 degrees is a common camera default).
-// Returns -1.0f to signal "not in use" (fov <= 0), so the caller can fall back
-// to the explicit zoom_level setting.
-static float fov_to_zoom(int fov_deg, int base_fov_deg = 90)
-{
-	if (fov_deg <= 0)
-		return -1.0f;
-
-	float fov_rad = (float)fov_deg * (float)M_PI / 180.0f;
-	float base_rad = (float)base_fov_deg * (float)M_PI / 180.0f;
-
-	return tanf(base_rad / 2.0f) / tanf(fov_rad / 2.0f);
-}
-
-// Computes the source-space crop rectangle given the current zoom/FOV and
-// crop offset settings. zoom > 1.0 shrinks the crop region (zooms in).
+// Computes the source-space crop rectangle for crop_width x crop_height,
+// anchored at (crop_anchor_x, crop_anchor_y) -- or centered when either
+// anchor coordinate is negative (the default). The crop size is clamped to
+// the source frame's dimensions rather than erroring or padding.
 static cv::Rect compute_crop_rect(int src_w, int src_h, udp_stream_filter *f)
 {
-	float zoom = fov_to_zoom(f->fov);
-	if (zoom < 0.0f)
-		zoom = f->zoom_level > 0.01f ? f->zoom_level : 1.0f;
+	int crop_w = std::max(1, std::min(f->crop_width, src_w));
+	int crop_h = std::max(1, std::min(f->crop_height, src_h));
 
-	float crop_w = (float)src_w / zoom;
-	float crop_h = (float)src_h / zoom;
-
-	if (f->keep_aspect && f->out_w > 0 && f->out_h > 0) {
-		float target_aspect = (float)f->out_w / (float)f->out_h;
-		float crop_aspect = crop_w / crop_h;
-
-		if (crop_aspect > target_aspect)
-			crop_w = crop_h * target_aspect;
-		else
-			crop_h = crop_w / target_aspect;
-	}
-
-	crop_w = std::min(crop_w, (float)src_w);
-	crop_h = std::min(crop_h, (float)src_h);
-	crop_w = std::max(crop_w, 2.0f);
-	crop_h = std::max(crop_h, 2.0f);
-
-	float cx, cy;
-	if (f->crop_mode == 1) {
-		// Custom offset, relative to frame center.
-		cx = src_w / 2.0f + (float)f->crop_off_x;
-		cy = src_h / 2.0f + (float)f->crop_off_y;
-	} else {
-		// Center crop.
-		cx = src_w / 2.0f;
-		cy = src_h / 2.0f;
-	}
-
-	float x = cx - crop_w / 2.0f;
-	float y = cy - crop_h / 2.0f;
+	int left = f->crop_anchor_x >= 0 ? f->crop_anchor_x : (src_w - crop_w) / 2;
+	int top = f->crop_anchor_y >= 0 ? f->crop_anchor_y : (src_h - crop_h) / 2;
 
 	// Clamp so the crop rect stays fully inside the source frame.
-	x = std::max(0.0f, std::min(x, (float)src_w - crop_w));
-	y = std::max(0.0f, std::min(y, (float)src_h - crop_h));
+	left = std::max(0, std::min(left, src_w - crop_w));
+	top = std::max(0, std::min(top, src_h - crop_h));
 
-	return cv::Rect((int)std::round(x), (int)std::round(y), (int)std::round(crop_w), (int)std::round(crop_h));
+	return cv::Rect(left, top, crop_w, crop_h);
 }
 
-// Applies crop/zoom (if enabled) and resizes to the configured output
-// resolution. Always returns an owned (deep-copied) Mat.
-static cv::Mat process_crop_zoom(udp_stream_filter *f, const cv::Mat &src)
+// Applies the native pixel crop (if enabled). This is a straight
+// frame[top:top+h, left:left+w] extraction -- never a resize -- so the
+// receiver gets exactly the requested pixels at native resolution. Always
+// returns an owned (deep-copied) Mat.
+static cv::Mat process_crop(udp_stream_filter *f, const cv::Mat &src)
 {
-	int out_w = f->out_w > 0 ? f->out_w : src.cols;
-	int out_h = f->out_h > 0 ? f->out_h : src.rows;
+	if (!f->crop_enabled)
+		return src.clone();
 
-	cv::Mat working = src;
-
-	if (f->crop_zoom_output) {
-		cv::Rect r = compute_crop_rect(src.cols, src.rows, f);
-		working = src(r);
-	}
-
-	if (working.cols == out_w && working.rows == out_h)
-		return working.clone();
-
-	cv::Mat resized;
-	cv::resize(working, resized, cv::Size(out_w, out_h), 0, 0, cv::INTER_LINEAR);
-	return resized;
+	cv::Rect r = compute_crop_rect(src.cols, src.rows, f);
+	return src(r).clone();
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +300,7 @@ static void capture_and_queue_frame(udp_stream_filter *f, obs_source_t *target, 
 
 	gs_stagesurface_unmap(f->stagesurface);
 
-	cv::Mat out_frame = process_crop_zoom(f, bgr);
+	cv::Mat out_frame = process_crop(f, bgr);
 
 	{
 		std::lock_guard<std::mutex> lock(f->enc_mtx);
@@ -471,16 +410,12 @@ static void udp_stream_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "target_port", 5600);
 	obs_data_set_default_int(settings, "jpeg_quality", 80);
 	obs_data_set_default_int(settings, "max_fps", 0);
-	obs_data_set_default_bool(settings, "crop_zoom_output", false);
+	obs_data_set_default_bool(settings, "crop_enabled", false);
 	obs_data_set_default_int(settings, "output_preset", 0);
-	obs_data_set_default_int(settings, "fov", 0);
-	obs_data_set_default_double(settings, "zoom_level", 1.0);
-	obs_data_set_default_int(settings, "out_w", 1920);
-	obs_data_set_default_int(settings, "out_h", 1080);
-	obs_data_set_default_int(settings, "crop_mode", 0);
-	obs_data_set_default_int(settings, "crop_off_x", 0);
-	obs_data_set_default_int(settings, "crop_off_y", 0);
-	obs_data_set_default_bool(settings, "keep_aspect", true);
+	obs_data_set_default_int(settings, "crop_width", 320);
+	obs_data_set_default_int(settings, "crop_height", 320);
+	obs_data_set_default_int(settings, "crop_anchor_x", -1);
+	obs_data_set_default_int(settings, "crop_anchor_y", -1);
 }
 
 static void udp_stream_update(void *data, obs_data_t *settings)
@@ -494,28 +429,22 @@ static void udp_stream_update(void *data, obs_data_t *settings)
 
 	f->jpeg_quality = (int)obs_data_get_int(settings, "jpeg_quality");
 	f->max_fps = (int)obs_data_get_int(settings, "max_fps");
-	f->fov = (int)obs_data_get_int(settings, "fov");
-	f->zoom_level = (float)obs_data_get_double(settings, "zoom_level");
-	f->crop_off_x = (int)obs_data_get_int(settings, "crop_off_x");
-	f->crop_off_y = (int)obs_data_get_int(settings, "crop_off_y");
+	f->crop_anchor_x = (int)obs_data_get_int(settings, "crop_anchor_x");
+	f->crop_anchor_y = (int)obs_data_get_int(settings, "crop_anchor_y");
 
 	f->output_preset = (int)obs_data_get_int(settings, "output_preset");
 	int preset_size = f->output_preset == 1 ? 320 : f->output_preset == 2 ? 640 : 0;
 
 	if (preset_size > 0) {
-		// Presets force a square center-crop at the given size; zoom
-		// amount and crop offset remain user-adjustable.
-		f->crop_zoom_output = true;
-		f->out_w = preset_size;
-		f->out_h = preset_size;
-		f->crop_mode = 0;
-		f->keep_aspect = true;
+		// Presets force a native square crop at the given size; the
+		// anchor remains user-adjustable (defaults to center).
+		f->crop_enabled = true;
+		f->crop_width = preset_size;
+		f->crop_height = preset_size;
 	} else {
-		f->crop_zoom_output = obs_data_get_bool(settings, "crop_zoom_output");
-		f->out_w = (int)obs_data_get_int(settings, "out_w");
-		f->out_h = (int)obs_data_get_int(settings, "out_h");
-		f->crop_mode = (int)obs_data_get_int(settings, "crop_mode");
-		f->keep_aspect = obs_data_get_bool(settings, "keep_aspect");
+		f->crop_enabled = obs_data_get_bool(settings, "crop_enabled");
+		f->crop_width = (int)obs_data_get_int(settings, "crop_width");
+		f->crop_height = (int)obs_data_get_int(settings, "crop_height");
 	}
 
 	bool ip_or_port_changed = (new_ip != f->target_ip) || (new_port != f->target_port);
@@ -530,19 +459,18 @@ static void udp_stream_update(void *data, obs_data_t *settings)
 	}
 }
 
-// Grays out the manual size/crop-mode controls whenever a standard output
-// preset (320x320 / 640x640) is active, since their effective values are
-// then dictated by the preset rather than user input.
+// Grays out the manual crop enable/size controls whenever a standard
+// output preset (320x320 / 640x640) is active, since their effective
+// values are then dictated by the preset rather than user input. The
+// anchor stays editable in all cases.
 static bool udp_stream_preset_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
 {
 	UNUSED_PARAMETER(property);
 	bool is_preset = obs_data_get_int(settings, "output_preset") != 0;
 
-	obs_property_set_enabled(obs_properties_get(props, "crop_zoom_output"), !is_preset);
-	obs_property_set_enabled(obs_properties_get(props, "out_w"), !is_preset);
-	obs_property_set_enabled(obs_properties_get(props, "out_h"), !is_preset);
-	obs_property_set_enabled(obs_properties_get(props, "crop_mode"), !is_preset);
-	obs_property_set_enabled(obs_properties_get(props, "keep_aspect"), !is_preset);
+	obs_property_set_enabled(obs_properties_get(props, "crop_enabled"), !is_preset);
+	obs_property_set_enabled(obs_properties_get(props, "crop_width"), !is_preset);
+	obs_property_set_enabled(obs_properties_get(props, "crop_height"), !is_preset);
 
 	return true;
 }
@@ -564,20 +492,11 @@ static obs_properties_t *udp_stream_get_properties(void *data)
 	obs_property_list_add_int(preset_list, "640x640", 2);
 	obs_property_set_modified_callback(preset_list, udp_stream_preset_modified);
 
-	obs_properties_add_bool(props, "crop_zoom_output", "Enable Crop/Zoom");
-	obs_properties_add_int(props, "fov", "Simulated FOV, deg (0 = use Zoom Level)", 0, 179, 1);
-	obs_properties_add_float(props, "zoom_level", "Zoom Level", 1.0, 10.0, 0.1);
-	obs_properties_add_int(props, "out_w", "Output Width", 16, 7680, 2);
-	obs_properties_add_int(props, "out_h", "Output Height", 16, 4320, 2);
-
-	obs_property_t *crop_mode_list =
-		obs_properties_add_list(props, "crop_mode", "Crop Mode", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(crop_mode_list, "Center", 0);
-	obs_property_list_add_int(crop_mode_list, "Custom Offset", 1);
-
-	obs_properties_add_int(props, "crop_off_x", "Crop Offset X (px)", -7680, 7680, 1);
-	obs_properties_add_int(props, "crop_off_y", "Crop Offset Y (px)", -4320, 4320, 1);
-	obs_properties_add_bool(props, "keep_aspect", "Keep Aspect Ratio");
+	obs_properties_add_bool(props, "crop_enabled", "Enable Crop");
+	obs_properties_add_int(props, "crop_width", "Crop Width (px)", 1, 7680, 1);
+	obs_properties_add_int(props, "crop_height", "Crop Height (px)", 1, 4320, 1);
+	obs_properties_add_int(props, "crop_anchor_x", "Crop Anchor X, px (-1 = center)", -1, 7680, 1);
+	obs_properties_add_int(props, "crop_anchor_y", "Crop Anchor Y, px (-1 = center)", -1, 4320, 1);
 
 	if (data) {
 		udp_stream_filter *f = (udp_stream_filter *)data;

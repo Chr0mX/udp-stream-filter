@@ -9,6 +9,9 @@ jobs:
   check-event:
     name: Check GitHub Event Data 🔎
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
     defaults:
       run:
         shell: bash

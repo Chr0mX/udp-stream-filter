@@ -16,6 +16,7 @@
 !LICENSE
 !README.md
 !vcpkg.json
+!installer.iss
 
 # Exclude lock files
 *.lock.json

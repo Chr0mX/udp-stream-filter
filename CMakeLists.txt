@@ -34,25 +34,25 @@ if(ENABLE_QT)
   )
 endif()
 
-# --- Added: OpenCV (core+imgproc) and libjpeg-turbo, statically linked -----
+# --- Added: OpenCV (core+imgproc+imgcodecs), statically linked ------------
 # Configure with the vcpkg static triplet so these get baked into the
 # plugin DLL directly, e.g.:
 #   cmake --preset windows-x64 ^
 #     -DCMAKE_TOOLCHAIN_FILE=<vcpkg-root>/scripts/buildsystems/vcpkg.cmake ^
 #     -DVCPKG_TARGET_TRIPLET=x64-windows-static
-find_package(OpenCV REQUIRED COMPONENTS core imgproc)
-find_package(libjpeg-turbo CONFIG REQUIRED)
+# JPEG encoding uses OpenCV's own imgcodecs (cv::imencode) rather than a
+# separate libjpeg-turbo dependency, since libjpeg-turbo is unreliable to
+# link across native package managers (e.g. Ubuntu's libturbojpeg0-dev is a
+# non-PIC static archive that cannot link into a shared module at all).
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_LIBS} libjpeg-turbo::turbojpeg-static)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_LIBS})
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_INCLUDE_DIRS})
 
 # Match vcpkg's static triplet's CRT linkage (/MT) so there's no
 # RuntimeLibrary mismatch at link time, and so the installed plugin needs
 # no VC++ redistributable on the end user's machine.
-set_target_properties(
-  ${CMAKE_PROJECT_NAME}
-  PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
-)
+set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # ----------------------------------------------------------------------------
 
 # NOTE: replace src/plugin-main.c with your plugin source file and update

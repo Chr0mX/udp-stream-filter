@@ -101,7 +101,7 @@ build() {
 
   if (( debug )) cmake_args+=(--debug-output)
 
-  cmake_args+=(--preset 'macos-ci')
+  cmake_args+=(--preset 'macos-ci' -DCMAKE_PREFIX_PATH="$(brew --prefix)")
 
   typeset -gx NSUnbufferedIO=YES
 
@@ -129,7 +129,6 @@ build() {
   local -a build_args=(
     ONLY_ACTIVE_ARCH=NO
     -arch arm64
-    -arch x86_64
     -project ${product_name}.xcodeproj
     -target ${product_name}
     -destination "generic/platform=macOS,name=Any Mac"

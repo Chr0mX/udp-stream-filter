@@ -3,7 +3,8 @@ param(
     [ValidateSet('x64')]
     [string] $Target = 'x64',
     [ValidateSet('Debug', 'RelWithDebInfo', 'Release', 'MinSizeRel')]
-    [string] $Configuration = 'RelWithDebInfo'
+    [string] $Configuration = 'RelWithDebInfo',
+    [switch] $Installer
 )
 
 $ErrorActionPreference = 'Stop'
@@ -67,6 +68,30 @@ function Package {
     }
     Compress-Archive -Force @CompressArgs
     Log-Group
+
+    if ( $Installer ) {
+        Log-Group "Building Windows installer for ${ProductName}..."
+
+        $IsccCandidates = @(
+            "${Env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            "${Env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+        )
+        $Iscc = $IsccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+        if ( -not $Iscc ) {
+            $IsccCommand = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ( $IsccCommand ) {
+                $Iscc = $IsccCommand.Source
+            }
+        }
+
+        if ( -not $Iscc ) {
+            throw "Inno Setup (ISCC.exe) was not found. Install it from https://jrsoftware.org/isinfo.php or via 'choco install innosetup'."
+        }
+
+        Invoke-External $Iscc "/DPluginName=${ProductName}" "/DPluginVersion=${ProductVersion}" "${ProjectRoot}/installer.iss"
+        Log-Group
+    }
 }
 
 Package

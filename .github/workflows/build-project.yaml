@@ -9,6 +9,9 @@ jobs:
   check-event:
     name: Check GitHub Event Data 🔎
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
     defaults:
       run:
         shell: bash
@@ -295,3 +298,10 @@ jobs:
         with:
           name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64-${{ needs.check-event.outputs.commitHash }}
           path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64*.*
+
+      - name: Upload Installer 📦
+        if: ${{ fromJSON(needs.check-event.outputs.package) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-installer-${{ needs.check-event.outputs.commitHash }}
+          path: ${{ github.workspace }}/installer_output/*.exe

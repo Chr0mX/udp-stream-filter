@@ -42,6 +42,7 @@ static int WSAGetLastError()
 #include <condition_variable>
 #include <vector>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 
@@ -87,6 +88,14 @@ struct udp_stream_filter {
 	std::condition_variable enc_cv;
 	cv::Mat pending;
 	bool has_pending{false};
+
+	// Live-measured FPS of frames actually sent over UDP (i.e. what the
+	// receiver sees), independent of the Max FPS cap. Updated by the encode
+	// thread roughly once per second; read from the UI thread when the
+	// filter's properties are (re)built.
+	std::atomic<double> measured_fps{0.0};
+	std::chrono::steady_clock::time_point fps_window_start;
+	int fps_window_count = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -247,6 +256,19 @@ static void encode_thread_func(udp_stream_filter *f)
 		if (cv::imencode(".jpg", frame, jpeg_buf, encode_params) && !jpeg_buf.empty()) {
 			send_jpeg_chunked(f, jpeg_buf.data(), (unsigned long)jpeg_buf.size(), frame_id);
 			f->frames_sent++;
+
+			// Recompute the measured send FPS about once per second and
+			// nudge the UI to refresh, so an open Filters properties
+			// dialog shows a live-updating number.
+			f->fps_window_count++;
+			auto now = std::chrono::steady_clock::now();
+			double elapsed = std::chrono::duration<double>(now - f->fps_window_start).count();
+			if (elapsed >= 1.0) {
+				f->measured_fps = f->fps_window_count / elapsed;
+				f->fps_window_count = 0;
+				f->fps_window_start = now;
+				obs_source_update_properties(f->source);
+			}
 		} else {
 			blog(LOG_WARNING, "[xudp] JPEG compression failed");
 		}
@@ -378,6 +400,7 @@ static void *udp_stream_create(obs_data_t *settings, obs_source_t *source)
 	f->frames_sent = 0;
 	f->first_sent = false;
 	f->last_send = std::chrono::steady_clock::now();
+	f->fps_window_start = std::chrono::steady_clock::now();
 
 	f->enc_running = true;
 	f->enc_thread = std::thread(encode_thread_func, f);
@@ -490,6 +513,7 @@ static obs_properties_t *udp_stream_get_properties(void *data)
 	obs_properties_add_int(props, "target_port", "Target Port", 1, 65535, 1);
 	obs_properties_add_int_slider(props, "jpeg_quality", "JPEG Quality", 1, 100, 1);
 	obs_properties_add_int(props, "max_fps", "Max FPS (0 = uncapped)", 0, 240, 1);
+	obs_properties_add_text(props, "stream_fps_debug", "Current Stream FPS (measured)", OBS_TEXT_INFO);
 
 	obs_property_t *preset_list = obs_properties_add_list(props, "output_preset", "Output Preset",
 							      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -508,6 +532,18 @@ static obs_properties_t *udp_stream_get_properties(void *data)
 		udp_stream_filter *f = (udp_stream_filter *)data;
 		obs_data_t *settings = obs_source_get_settings(f->source);
 		udp_stream_preset_modified(props, preset_list, settings);
+
+		// Live status text, refreshed each time the properties are
+		// (re)built -- see the periodic obs_source_update_properties()
+		// call in encode_thread_func that keeps an open dialog current.
+		char fps_buf[64];
+		double fps = f->measured_fps.load();
+		if (f->udp_enabled && fps > 0.0)
+			snprintf(fps_buf, sizeof(fps_buf), "%.1f fps", fps);
+		else
+			snprintf(fps_buf, sizeof(fps_buf), "-- (not streaming)");
+		obs_data_set_string(settings, "stream_fps_debug", fps_buf);
+
 		obs_data_release(settings);
 	}
 

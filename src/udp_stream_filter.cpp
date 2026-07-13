@@ -93,36 +93,33 @@ struct udp_stream_filter {
 // Native pixel crop (no resize/interpolation)
 // ---------------------------------------------------------------------------
 
-// Computes the source-space crop rectangle for crop_width x crop_height,
-// anchored at (crop_anchor_x, crop_anchor_y) -- or centered when either
-// anchor coordinate is negative (the default). The crop size is clamped to
-// the source frame's dimensions rather than erroring or padding.
-static cv::Rect compute_crop_rect(int src_w, int src_h, udp_stream_filter *f)
+// Computes the source-space capture rectangle: crop_width x crop_height
+// anchored at (crop_anchor_x, crop_anchor_y) when cropping is enabled (or
+// centered when either anchor coordinate is negative, the default), or the
+// full source frame otherwise. The size is clamped to the source frame's
+// dimensions rather than erroring or padding.
+//
+// This is used to size the GPU texrender/stagesurface for capture itself,
+// so capture only ever reads back the pixels actually needed -- not the
+// full source frame -- which is what makes high FPS (e.g. 120fps) with a
+// small crop achievable: the GPU->CPU readback (gs_stagesurface_map) and
+// color conversion cost scale with the crop size, not the source size.
+static cv::Rect compute_capture_rect(int src_w, int src_h, udp_stream_filter *f)
 {
+	if (!f->crop_enabled)
+		return cv::Rect(0, 0, src_w, src_h);
+
 	int crop_w = std::max(1, std::min(f->crop_width, src_w));
 	int crop_h = std::max(1, std::min(f->crop_height, src_h));
 
 	int left = f->crop_anchor_x >= 0 ? f->crop_anchor_x : (src_w - crop_w) / 2;
 	int top = f->crop_anchor_y >= 0 ? f->crop_anchor_y : (src_h - crop_h) / 2;
 
-	// Clamp so the crop rect stays fully inside the source frame.
+	// Clamp so the capture rect stays fully inside the source frame.
 	left = std::max(0, std::min(left, src_w - crop_w));
 	top = std::max(0, std::min(top, src_h - crop_h));
 
 	return cv::Rect(left, top, crop_w, crop_h);
-}
-
-// Applies the native pixel crop (if enabled). This is a straight
-// frame[top:top+h, left:left+w] extraction -- never a resize -- so the
-// receiver gets exactly the requested pixels at native resolution. Always
-// returns an owned (deep-copied) Mat.
-static cv::Mat process_crop(udp_stream_filter *f, const cv::Mat &src)
-{
-	if (!f->crop_enabled)
-		return src.clone();
-
-	cv::Rect r = compute_crop_rect(src.cols, src.rows, f);
-	return src(r).clone();
 }
 
 // ---------------------------------------------------------------------------
@@ -260,8 +257,12 @@ static void encode_thread_func(udp_stream_filter *f)
 // Frame capture (GPU texture -> CPU Mat) and queueing
 // ---------------------------------------------------------------------------
 
-static void capture_and_queue_frame(udp_stream_filter *f, obs_source_t *target, uint32_t width, uint32_t height)
+static void capture_and_queue_frame(udp_stream_filter *f, obs_source_t *target, uint32_t src_width, uint32_t src_height)
 {
+	cv::Rect capture_rect = compute_capture_rect((int)src_width, (int)src_height, f);
+	uint32_t width = (uint32_t)capture_rect.width;
+	uint32_t height = (uint32_t)capture_rect.height;
+
 	gs_texrender_reset(f->texrender);
 
 	if (!gs_texrender_begin(f->texrender, width, height))
@@ -270,7 +271,12 @@ static void capture_and_queue_frame(udp_stream_filter *f, obs_source_t *target, 
 	struct vec4 clear_color;
 	vec4_zero(&clear_color);
 	gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
-	gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
+	// Ortho bounds are the capture rect in source space, not [0,width]x[0,height]:
+	// mapping just that sub-rect onto the full (width x height) viewport captures
+	// exactly those source pixels at 1:1 scale -- a GPU-side crop with no resize,
+	// and critically, no readback of the full source frame when cropping is on.
+	gs_ortho((float)capture_rect.x, (float)(capture_rect.x + capture_rect.width), (float)capture_rect.y,
+		 (float)(capture_rect.y + capture_rect.height), -100.0f, 100.0f);
 
 	obs_source_video_render(target);
 
@@ -300,7 +306,7 @@ static void capture_and_queue_frame(udp_stream_filter *f, obs_source_t *target, 
 
 	gs_stagesurface_unmap(f->stagesurface);
 
-	cv::Mat out_frame = process_crop(f, bgr);
+	cv::Mat out_frame = bgr.clone();
 
 	{
 		std::lock_guard<std::mutex> lock(f->enc_mtx);

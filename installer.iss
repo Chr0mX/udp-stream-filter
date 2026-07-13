@@ -14,7 +14,7 @@
 
 #define PluginName "Colour"     ; must exactly match buildspec.json "name"
 #define PluginDisplayName "Colour"
-#define PluginVersion "1.0.3"              ; must match buildspec.json "version"
+#define PluginVersion "1.0.4"              ; must match buildspec.json "version"
 #define RundirConfig "RelWithDebInfo"      ; matches the CMake preset's build configuration
 ; NOTE: this build's post-build step copies the DLL/PDB flat into
 ; rundir\<config>\, and only the data/ folder contents into a

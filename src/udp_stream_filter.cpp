@@ -406,7 +406,8 @@ static void udp_stream_video_render(void *data, gs_effect_t *effect)
 
 	if (f->max_fps > 0) {
 		auto now = std::chrono::steady_clock::now();
-		std::chrono::duration<double> min_interval(1.0 / (double)f->max_fps);
+		auto min_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+			std::chrono::duration<double>(1.0 / (double)f->max_fps));
 
 		if (!f->first_sent) {
 			f->last_send = now;

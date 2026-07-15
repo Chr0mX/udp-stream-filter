@@ -406,14 +406,31 @@ static void udp_stream_video_render(void *data, gs_effect_t *effect)
 
 	if (f->max_fps > 0) {
 		auto now = std::chrono::steady_clock::now();
-		double elapsed = std::chrono::duration<double>(now - f->last_send).count();
-		double min_interval = 1.0 / (double)f->max_fps;
+		std::chrono::duration<double> min_interval(1.0 / (double)f->max_fps);
 
-		if (f->first_sent && elapsed < min_interval) {
-			should_capture = false;
-		} else {
+		if (!f->first_sent) {
 			f->last_send = now;
 			f->first_sent = true;
+		} else if (now - f->last_send < min_interval) {
+			should_capture = false;
+		} else {
+			// Advance the schedule by exactly one interval (banking any
+			// leftover time) instead of snapping to "now". Snapping to
+			// "now" always floors the achievable rate to an exact integer
+			// divisor of the render callback's tick rate (e.g. requesting
+			// 140fps against a 240Hz render loop always lands on 120,
+			// never 140) because it throws away the fractional progress
+			// made toward the next frame. Banking it lets the gate "catch
+			// up" over multiple ticks so the long-run average converges
+			// on the actual requested max_fps.
+			f->last_send += min_interval;
+
+			// If we've fallen far behind (e.g. after a stall/hitch),
+			// don't let the bank grow unbounded -- that would fire a
+			// burst of back-to-back catch-up frames. Clamp to at most
+			// one interval behind now.
+			if (now - f->last_send > min_interval)
+				f->last_send = now - min_interval;
 		}
 	}
 

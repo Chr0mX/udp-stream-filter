@@ -54,7 +54,19 @@ static void udp_stream_update(void *data, obs_data_t *settings);
 struct udp_stream_filter {
 	obs_source_t *source;
 	gs_texrender_t *texrender;
-	gs_stagesurf_t *stagesurface;
+
+	// Double-buffered GPU->CPU readback: gs_stage_texture() queues an async
+	// GPU copy into the "write" buffer, then the previous frame's "read"
+	// buffer (staged last call, and by now finished on the GPU) is mapped
+	// -- so gs_stagesurface_map() never has to block waiting for the
+	// current frame's copy to complete. Costs one frame of latency but
+	// removes the per-frame GPU pipeline stall that was capping FPS well
+	// below both the canvas rate and the Max FPS setting.
+	gs_stagesurf_t *stagesurface[2];
+	uint32_t stage_width[2];
+	uint32_t stage_height[2];
+	bool stage_valid[2];
+	int stage_write_idx;
 
 	bool udp_enabled;
 	std::string target_ip;
@@ -96,6 +108,7 @@ struct udp_stream_filter {
 	std::atomic<double> measured_fps{0.0};
 	std::chrono::steady_clock::time_point fps_window_start;
 	int fps_window_count = 0;
+	std::chrono::steady_clock::time_point last_ui_refresh;
 };
 
 // ---------------------------------------------------------------------------
@@ -257,9 +270,11 @@ static void encode_thread_func(udp_stream_filter *f)
 			send_jpeg_chunked(f, jpeg_buf.data(), (unsigned long)jpeg_buf.size(), frame_id);
 			f->frames_sent++;
 
-			// Recompute the measured send FPS about once per second and
-			// nudge the UI to refresh, so an open Filters properties
-			// dialog shows a live-updating number.
+			// Recompute the measured send FPS about once per second for
+			// accuracy, but only nudge the UI to refresh every few
+			// seconds -- obs_source_update_properties() rebuilds the
+			// whole Filters properties dialog, which fights typing/
+			// clicking in other fields (e.g. Max FPS) if done too often.
 			f->fps_window_count++;
 			auto now = std::chrono::steady_clock::now();
 			double elapsed = std::chrono::duration<double>(now - f->fps_window_start).count();
@@ -267,7 +282,13 @@ static void encode_thread_func(udp_stream_filter *f)
 				f->measured_fps = f->fps_window_count / elapsed;
 				f->fps_window_count = 0;
 				f->fps_window_start = now;
-				obs_source_update_properties(f->source);
+
+				double since_ui_refresh =
+					std::chrono::duration<double>(now - f->last_ui_refresh).count();
+				if (since_ui_refresh >= 4.0) {
+					f->last_ui_refresh = now;
+					obs_source_update_properties(f->source);
+				}
 			}
 		} else {
 			blog(LOG_WARNING, "[xudp] JPEG compression failed");
@@ -308,34 +329,48 @@ static void capture_and_queue_frame(udp_stream_filter *f, obs_source_t *target, 
 	if (!tex)
 		return;
 
-	if (!f->stagesurface || gs_stagesurface_get_width(f->stagesurface) != width ||
-	    gs_stagesurface_get_height(f->stagesurface) != height) {
-		if (f->stagesurface)
-			gs_stagesurface_destroy(f->stagesurface);
-		f->stagesurface = gs_stagesurface_create(width, height, GS_BGRA);
+	int write_idx = f->stage_write_idx;
+	int read_idx = 1 - write_idx;
+
+	if (!f->stagesurface[write_idx] || f->stage_width[write_idx] != width || f->stage_height[write_idx] != height) {
+		if (f->stagesurface[write_idx])
+			gs_stagesurface_destroy(f->stagesurface[write_idx]);
+		f->stagesurface[write_idx] = gs_stagesurface_create(width, height, GS_BGRA);
+		f->stage_width[write_idx] = width;
+		f->stage_height[write_idx] = height;
+		f->stage_valid[write_idx] = false;
 	}
 
-	gs_stage_texture(f->stagesurface, tex);
+	// Queue this frame's GPU->CPU copy; it completes asynchronously and is
+	// only mapped on a *later* call (see below), so this never blocks.
+	gs_stage_texture(f->stagesurface[write_idx], tex);
+	f->stage_valid[write_idx] = true;
 
-	uint8_t *mapped_data = nullptr;
-	uint32_t linesize = 0;
-	if (!gs_stagesurface_map(f->stagesurface, &mapped_data, &linesize))
-		return;
+	// Read back the other buffer's copy, staged on a previous call -- by
+	// now the GPU has had at least one full frame to finish it, so this
+	// map should return immediately instead of stalling.
+	if (f->stage_valid[read_idx] && f->stage_width[read_idx] == width && f->stage_height[read_idx] == height) {
+		uint8_t *mapped_data = nullptr;
+		uint32_t linesize = 0;
+		if (gs_stagesurface_map(f->stagesurface[read_idx], &mapped_data, &linesize)) {
+			cv::Mat bgra((int)height, (int)width, CV_8UC4, mapped_data, linesize);
+			cv::Mat bgr;
+			cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
 
-	cv::Mat bgra((int)height, (int)width, CV_8UC4, mapped_data, linesize);
-	cv::Mat bgr;
-	cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
+			gs_stagesurface_unmap(f->stagesurface[read_idx]);
 
-	gs_stagesurface_unmap(f->stagesurface);
+			cv::Mat out_frame = bgr.clone();
 
-	cv::Mat out_frame = bgr.clone();
-
-	{
-		std::lock_guard<std::mutex> lock(f->enc_mtx);
-		f->pending = out_frame;
-		f->has_pending = true;
+			{
+				std::lock_guard<std::mutex> lock(f->enc_mtx);
+				f->pending = out_frame;
+				f->has_pending = true;
+			}
+			f->enc_cv.notify_one();
+		}
 	}
-	f->enc_cv.notify_one();
+
+	f->stage_write_idx = read_idx;
 }
 
 // ---------------------------------------------------------------------------
@@ -395,12 +430,18 @@ static void *udp_stream_create(obs_data_t *settings, obs_source_t *source)
 	udp_stream_filter *f = new udp_stream_filter();
 	f->source = source;
 	f->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
-	f->stagesurface = nullptr;
+	f->stagesurface[0] = nullptr;
+	f->stagesurface[1] = nullptr;
+	f->stage_width[0] = f->stage_width[1] = 0;
+	f->stage_height[0] = f->stage_height[1] = 0;
+	f->stage_valid[0] = f->stage_valid[1] = false;
+	f->stage_write_idx = 0;
 	f->sock = INVALID_SOCKET;
 	f->frames_sent = 0;
 	f->first_sent = false;
 	f->last_send = std::chrono::steady_clock::now();
 	f->fps_window_start = std::chrono::steady_clock::now();
+	f->last_ui_refresh = std::chrono::steady_clock::now();
 
 	f->enc_running = true;
 	f->enc_thread = std::thread(encode_thread_func, f);
@@ -423,8 +464,10 @@ static void udp_stream_destroy(void *data)
 		closesocket(f->sock);
 
 	obs_enter_graphics();
-	if (f->stagesurface)
-		gs_stagesurface_destroy(f->stagesurface);
+	if (f->stagesurface[0])
+		gs_stagesurface_destroy(f->stagesurface[0]);
+	if (f->stagesurface[1])
+		gs_stagesurface_destroy(f->stagesurface[1]);
 	if (f->texrender)
 		gs_texrender_destroy(f->texrender);
 	obs_leave_graphics();

@@ -1,0 +1,36 @@
+name: Prune Old Artifacts
+run-name: prune artifacts older than 1 day 🧹
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+permissions:
+  actions: write
+jobs:
+  prune:
+    name: Delete Artifacts Older Than 1 Day 🧹
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Delete Old Artifacts 🗑️
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          : Delete Old Artifacts 🗑️
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+          set -euo pipefail
+
+          cutoff_epoch="$(date -u -d '1 day ago' +%s)"
+          deleted=0
+
+          # Process substitution (not a pipe) so `deleted` persists in this shell.
+          while IFS=$'\t' read -r id created_at name; do
+            created_epoch="$(date -u -d "${created_at}" +%s)"
+            if (( created_epoch < cutoff_epoch )); then
+              echo "Deleting artifact ${id} (\"${name}\", created ${created_at})"
+              gh api -X DELETE "repos/${REPO}/actions/artifacts/${id}" || echo "  (already gone or failed, skipping)"
+              deleted=$((deleted + 1))
+            fi
+          done < <(gh api "repos/${REPO}/actions/artifacts" --paginate --jq '.artifacts[] | "\(.id)\t\(.created_at)\t\(.name)"')
+
+          echo "Deleted ${deleted} artifact(s) older than 1 day."

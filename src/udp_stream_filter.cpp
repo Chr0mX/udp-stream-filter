@@ -42,6 +42,7 @@ static int WSAGetLastError()
 #include <condition_variable>
 #include <vector>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 
@@ -53,7 +54,19 @@ static void udp_stream_update(void *data, obs_data_t *settings);
 struct udp_stream_filter {
 	obs_source_t *source;
 	gs_texrender_t *texrender;
-	gs_stagesurf_t *stagesurface;
+
+	// Double-buffered GPU->CPU readback: gs_stage_texture() queues an async
+	// GPU copy into the "write" buffer, then the previous frame's "read"
+	// buffer (staged last call, and by now finished on the GPU) is mapped
+	// -- so gs_stagesurface_map() never has to block waiting for the
+	// current frame's copy to complete. Costs one frame of latency but
+	// removes the per-frame GPU pipeline stall that was capping FPS well
+	// below both the canvas rate and the Max FPS setting.
+	gs_stagesurf_t *stagesurface[2];
+	uint32_t stage_width[2];
+	uint32_t stage_height[2];
+	bool stage_valid[2];
+	int stage_write_idx;
 
 	bool udp_enabled;
 	std::string target_ip;
@@ -87,42 +100,48 @@ struct udp_stream_filter {
 	std::condition_variable enc_cv;
 	cv::Mat pending;
 	bool has_pending{false};
+
+	// Live-measured FPS of frames actually sent over UDP (i.e. what the
+	// receiver sees), independent of the Max FPS cap. Updated by the encode
+	// thread roughly once per second; read from the UI thread when the
+	// filter's properties are (re)built.
+	std::atomic<double> measured_fps{0.0};
+	std::chrono::steady_clock::time_point fps_window_start;
+	int fps_window_count = 0;
+	std::chrono::steady_clock::time_point last_ui_refresh;
 };
 
 // ---------------------------------------------------------------------------
 // Native pixel crop (no resize/interpolation)
 // ---------------------------------------------------------------------------
 
-// Computes the source-space crop rectangle for crop_width x crop_height,
-// anchored at (crop_anchor_x, crop_anchor_y) -- or centered when either
-// anchor coordinate is negative (the default). The crop size is clamped to
-// the source frame's dimensions rather than erroring or padding.
-static cv::Rect compute_crop_rect(int src_w, int src_h, udp_stream_filter *f)
+// Computes the source-space capture rectangle: crop_width x crop_height
+// anchored at (crop_anchor_x, crop_anchor_y) when cropping is enabled (or
+// centered when either anchor coordinate is negative, the default), or the
+// full source frame otherwise. The size is clamped to the source frame's
+// dimensions rather than erroring or padding.
+//
+// This is used to size the GPU texrender/stagesurface for capture itself,
+// so capture only ever reads back the pixels actually needed -- not the
+// full source frame -- which is what makes high FPS (e.g. 120fps) with a
+// small crop achievable: the GPU->CPU readback (gs_stagesurface_map) and
+// color conversion cost scale with the crop size, not the source size.
+static cv::Rect compute_capture_rect(int src_w, int src_h, udp_stream_filter *f)
 {
+	if (!f->crop_enabled)
+		return cv::Rect(0, 0, src_w, src_h);
+
 	int crop_w = std::max(1, std::min(f->crop_width, src_w));
 	int crop_h = std::max(1, std::min(f->crop_height, src_h));
 
 	int left = f->crop_anchor_x >= 0 ? f->crop_anchor_x : (src_w - crop_w) / 2;
 	int top = f->crop_anchor_y >= 0 ? f->crop_anchor_y : (src_h - crop_h) / 2;
 
-	// Clamp so the crop rect stays fully inside the source frame.
+	// Clamp so the capture rect stays fully inside the source frame.
 	left = std::max(0, std::min(left, src_w - crop_w));
 	top = std::max(0, std::min(top, src_h - crop_h));
 
 	return cv::Rect(left, top, crop_w, crop_h);
-}
-
-// Applies the native pixel crop (if enabled). This is a straight
-// frame[top:top+h, left:left+w] extraction -- never a resize -- so the
-// receiver gets exactly the requested pixels at native resolution. Always
-// returns an owned (deep-copied) Mat.
-static cv::Mat process_crop(udp_stream_filter *f, const cv::Mat &src)
-{
-	if (!f->crop_enabled)
-		return src.clone();
-
-	cv::Rect r = compute_crop_rect(src.cols, src.rows, f);
-	return src(r).clone();
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +269,27 @@ static void encode_thread_func(udp_stream_filter *f)
 		if (cv::imencode(".jpg", frame, jpeg_buf, encode_params) && !jpeg_buf.empty()) {
 			send_jpeg_chunked(f, jpeg_buf.data(), (unsigned long)jpeg_buf.size(), frame_id);
 			f->frames_sent++;
+
+			// Recompute the measured send FPS about once per second for
+			// accuracy, but only nudge the UI to refresh every few
+			// seconds -- obs_source_update_properties() rebuilds the
+			// whole Filters properties dialog, which fights typing/
+			// clicking in other fields (e.g. Max FPS) if done too often.
+			f->fps_window_count++;
+			auto now = std::chrono::steady_clock::now();
+			double elapsed = std::chrono::duration<double>(now - f->fps_window_start).count();
+			if (elapsed >= 1.0) {
+				f->measured_fps = f->fps_window_count / elapsed;
+				f->fps_window_count = 0;
+				f->fps_window_start = now;
+
+				double since_ui_refresh =
+					std::chrono::duration<double>(now - f->last_ui_refresh).count();
+				if (since_ui_refresh >= 4.0) {
+					f->last_ui_refresh = now;
+					obs_source_update_properties(f->source);
+				}
+			}
 		} else {
 			blog(LOG_WARNING, "[xudp] JPEG compression failed");
 		}
@@ -260,8 +300,12 @@ static void encode_thread_func(udp_stream_filter *f)
 // Frame capture (GPU texture -> CPU Mat) and queueing
 // ---------------------------------------------------------------------------
 
-static void capture_and_queue_frame(udp_stream_filter *f, obs_source_t *target, uint32_t width, uint32_t height)
+static void capture_and_queue_frame(udp_stream_filter *f, obs_source_t *target, uint32_t src_width, uint32_t src_height)
 {
+	cv::Rect capture_rect = compute_capture_rect((int)src_width, (int)src_height, f);
+	uint32_t width = (uint32_t)capture_rect.width;
+	uint32_t height = (uint32_t)capture_rect.height;
+
 	gs_texrender_reset(f->texrender);
 
 	if (!gs_texrender_begin(f->texrender, width, height))
@@ -270,7 +314,12 @@ static void capture_and_queue_frame(udp_stream_filter *f, obs_source_t *target, 
 	struct vec4 clear_color;
 	vec4_zero(&clear_color);
 	gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
-	gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
+	// Ortho bounds are the capture rect in source space, not [0,width]x[0,height]:
+	// mapping just that sub-rect onto the full (width x height) viewport captures
+	// exactly those source pixels at 1:1 scale -- a GPU-side crop with no resize,
+	// and critically, no readback of the full source frame when cropping is on.
+	gs_ortho((float)capture_rect.x, (float)(capture_rect.x + capture_rect.width), (float)capture_rect.y,
+		 (float)(capture_rect.y + capture_rect.height), -100.0f, 100.0f);
 
 	obs_source_video_render(target);
 
@@ -280,34 +329,48 @@ static void capture_and_queue_frame(udp_stream_filter *f, obs_source_t *target, 
 	if (!tex)
 		return;
 
-	if (!f->stagesurface || gs_stagesurface_get_width(f->stagesurface) != width ||
-	    gs_stagesurface_get_height(f->stagesurface) != height) {
-		if (f->stagesurface)
-			gs_stagesurface_destroy(f->stagesurface);
-		f->stagesurface = gs_stagesurface_create(width, height, GS_BGRA);
+	int write_idx = f->stage_write_idx;
+	int read_idx = 1 - write_idx;
+
+	if (!f->stagesurface[write_idx] || f->stage_width[write_idx] != width || f->stage_height[write_idx] != height) {
+		if (f->stagesurface[write_idx])
+			gs_stagesurface_destroy(f->stagesurface[write_idx]);
+		f->stagesurface[write_idx] = gs_stagesurface_create(width, height, GS_BGRA);
+		f->stage_width[write_idx] = width;
+		f->stage_height[write_idx] = height;
+		f->stage_valid[write_idx] = false;
 	}
 
-	gs_stage_texture(f->stagesurface, tex);
+	// Queue this frame's GPU->CPU copy; it completes asynchronously and is
+	// only mapped on a *later* call (see below), so this never blocks.
+	gs_stage_texture(f->stagesurface[write_idx], tex);
+	f->stage_valid[write_idx] = true;
 
-	uint8_t *mapped_data = nullptr;
-	uint32_t linesize = 0;
-	if (!gs_stagesurface_map(f->stagesurface, &mapped_data, &linesize))
-		return;
+	// Read back the other buffer's copy, staged on a previous call -- by
+	// now the GPU has had at least one full frame to finish it, so this
+	// map should return immediately instead of stalling.
+	if (f->stage_valid[read_idx] && f->stage_width[read_idx] == width && f->stage_height[read_idx] == height) {
+		uint8_t *mapped_data = nullptr;
+		uint32_t linesize = 0;
+		if (gs_stagesurface_map(f->stagesurface[read_idx], &mapped_data, &linesize)) {
+			cv::Mat bgra((int)height, (int)width, CV_8UC4, mapped_data, linesize);
+			cv::Mat bgr;
+			cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
 
-	cv::Mat bgra((int)height, (int)width, CV_8UC4, mapped_data, linesize);
-	cv::Mat bgr;
-	cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
+			gs_stagesurface_unmap(f->stagesurface[read_idx]);
 
-	gs_stagesurface_unmap(f->stagesurface);
+			cv::Mat out_frame = bgr.clone();
 
-	cv::Mat out_frame = process_crop(f, bgr);
-
-	{
-		std::lock_guard<std::mutex> lock(f->enc_mtx);
-		f->pending = out_frame;
-		f->has_pending = true;
+			{
+				std::lock_guard<std::mutex> lock(f->enc_mtx);
+				f->pending = out_frame;
+				f->has_pending = true;
+			}
+			f->enc_cv.notify_one();
+		}
 	}
-	f->enc_cv.notify_one();
+
+	f->stage_write_idx = read_idx;
 }
 
 // ---------------------------------------------------------------------------
@@ -343,14 +406,32 @@ static void udp_stream_video_render(void *data, gs_effect_t *effect)
 
 	if (f->max_fps > 0) {
 		auto now = std::chrono::steady_clock::now();
-		double elapsed = std::chrono::duration<double>(now - f->last_send).count();
-		double min_interval = 1.0 / (double)f->max_fps;
+		auto min_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+			std::chrono::duration<double>(1.0 / (double)f->max_fps));
 
-		if (f->first_sent && elapsed < min_interval) {
-			should_capture = false;
-		} else {
+		if (!f->first_sent) {
 			f->last_send = now;
 			f->first_sent = true;
+		} else if (now - f->last_send < min_interval) {
+			should_capture = false;
+		} else {
+			// Advance the schedule by exactly one interval (banking any
+			// leftover time) instead of snapping to "now". Snapping to
+			// "now" always floors the achievable rate to an exact integer
+			// divisor of the render callback's tick rate (e.g. requesting
+			// 140fps against a 240Hz render loop always lands on 120,
+			// never 140) because it throws away the fractional progress
+			// made toward the next frame. Banking it lets the gate "catch
+			// up" over multiple ticks so the long-run average converges
+			// on the actual requested max_fps.
+			f->last_send += min_interval;
+
+			// If we've fallen far behind (e.g. after a stall/hitch),
+			// don't let the bank grow unbounded -- that would fire a
+			// burst of back-to-back catch-up frames. Clamp to at most
+			// one interval behind now.
+			if (now - f->last_send > min_interval)
+				f->last_send = now - min_interval;
 		}
 	}
 
@@ -367,11 +448,18 @@ static void *udp_stream_create(obs_data_t *settings, obs_source_t *source)
 	udp_stream_filter *f = new udp_stream_filter();
 	f->source = source;
 	f->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
-	f->stagesurface = nullptr;
+	f->stagesurface[0] = nullptr;
+	f->stagesurface[1] = nullptr;
+	f->stage_width[0] = f->stage_width[1] = 0;
+	f->stage_height[0] = f->stage_height[1] = 0;
+	f->stage_valid[0] = f->stage_valid[1] = false;
+	f->stage_write_idx = 0;
 	f->sock = INVALID_SOCKET;
 	f->frames_sent = 0;
 	f->first_sent = false;
 	f->last_send = std::chrono::steady_clock::now();
+	f->fps_window_start = std::chrono::steady_clock::now();
+	f->last_ui_refresh = std::chrono::steady_clock::now();
 
 	f->enc_running = true;
 	f->enc_thread = std::thread(encode_thread_func, f);
@@ -394,8 +482,10 @@ static void udp_stream_destroy(void *data)
 		closesocket(f->sock);
 
 	obs_enter_graphics();
-	if (f->stagesurface)
-		gs_stagesurface_destroy(f->stagesurface);
+	if (f->stagesurface[0])
+		gs_stagesurface_destroy(f->stagesurface[0]);
+	if (f->stagesurface[1])
+		gs_stagesurface_destroy(f->stagesurface[1]);
 	if (f->texrender)
 		gs_texrender_destroy(f->texrender);
 	obs_leave_graphics();
@@ -484,6 +574,7 @@ static obs_properties_t *udp_stream_get_properties(void *data)
 	obs_properties_add_int(props, "target_port", "Target Port", 1, 65535, 1);
 	obs_properties_add_int_slider(props, "jpeg_quality", "JPEG Quality", 1, 100, 1);
 	obs_properties_add_int(props, "max_fps", "Max FPS (0 = uncapped)", 0, 240, 1);
+	obs_properties_add_text(props, "stream_fps_debug", "Current Stream FPS (measured)", OBS_TEXT_INFO);
 
 	obs_property_t *preset_list = obs_properties_add_list(props, "output_preset", "Output Preset",
 							      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -502,6 +593,18 @@ static obs_properties_t *udp_stream_get_properties(void *data)
 		udp_stream_filter *f = (udp_stream_filter *)data;
 		obs_data_t *settings = obs_source_get_settings(f->source);
 		udp_stream_preset_modified(props, preset_list, settings);
+
+		// Live status text, refreshed each time the properties are
+		// (re)built -- see the periodic obs_source_update_properties()
+		// call in encode_thread_func that keeps an open dialog current.
+		char fps_buf[64];
+		double fps = f->measured_fps.load();
+		if (f->udp_enabled && fps > 0.0)
+			snprintf(fps_buf, sizeof(fps_buf), "%.1f fps", fps);
+		else
+			snprintf(fps_buf, sizeof(fps_buf), "-- (not streaming)");
+		obs_data_set_string(settings, "stream_fps_debug", fps_buf);
+
 		obs_data_release(settings);
 	}
 

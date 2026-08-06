@@ -88,6 +88,14 @@ struct udp_stream_filter {
 	bool suppress_bg;
 	bool adaptive_boost;
 
+	// Guards sock/addr/jpeg_quality, which are written by OBS's UI thread in
+	// udp_stream_update() (a settings change can close and recreate the
+	// socket) and read by the encode thread in send_jpeg_chunked(). Without
+	// it, changing Target IP or Port mid-stream could have the encode thread
+	// call sendto() on a descriptor the UI thread had just closed, or read a
+	// sockaddr while memset()/inet_pton() were half-way through rewriting it.
+	// enc_mtx does NOT cover this - it only guards the pending frame handoff.
+	std::mutex net_mtx;
 	SOCKET sock;
 	sockaddr_in addr;
 	std::chrono::steady_clock::time_point last_send;
@@ -158,7 +166,8 @@ static const size_t UDP_HEADER_SIZE = 16;
 static const size_t UDP_MAX_PAYLOAD = 60000; // LAN-only: let IP fragmentation handle MTU,
 					     // most frames fit in 1-2 datagrams instead of ~45
 
-static bool setup_socket(udp_stream_filter *f)
+// Caller must hold f->net_mtx.
+static bool setup_socket_locked(udp_stream_filter *f)
 {
 	if (f->sock != INVALID_SOCKET) {
 		closesocket(f->sock);
@@ -192,7 +201,18 @@ static bool setup_socket(udp_stream_filter *f)
 
 static void send_jpeg_chunked(udp_stream_filter *f, const uint8_t *jpeg, unsigned long jpeg_size, uint32_t frame_id)
 {
-	if (f->sock == INVALID_SOCKET || jpeg_size == 0)
+	if (jpeg_size == 0)
+		return;
+
+	// Held across the whole send so the UI thread can't close the socket or
+	// rewrite the destination address between chunks of one frame. sendto()
+	// on a UDP socket only copies into the socket buffer and returns, so
+	// this never blocks the UI thread for meaningfully long - and a settings
+	// change waiting out one frame's worth of chunks is the correct
+	// trade against sending on a closed descriptor.
+	std::lock_guard<std::mutex> net_lock(f->net_mtx);
+
+	if (f->sock == INVALID_SOCKET)
 		return;
 
 	uint16_t total_chunks = (uint16_t)((jpeg_size + UDP_MAX_PAYLOAD - 1) / UDP_MAX_PAYLOAD);
@@ -263,8 +283,17 @@ static void encode_thread_func(udp_stream_filter *f)
 		if (frame.empty())
 			continue;
 
+		// Snapshot under the lock - jpeg_quality is written by the UI
+		// thread in udp_stream_update(). Copied out rather than held so
+		// the (comparatively slow) imencode below runs unlocked.
+		int quality;
+		{
+			std::lock_guard<std::mutex> net_lock(f->net_mtx);
+			quality = f->jpeg_quality;
+		}
+
 		std::vector<uchar> jpeg_buf;
-		std::vector<int> encode_params = {cv::IMWRITE_JPEG_QUALITY, f->jpeg_quality};
+		std::vector<int> encode_params = {cv::IMWRITE_JPEG_QUALITY, quality};
 
 		if (cv::imencode(".jpg", frame, jpeg_buf, encode_params) && !jpeg_buf.empty()) {
 			send_jpeg_chunked(f, jpeg_buf.data(), (unsigned long)jpeg_buf.size(), frame_id);
@@ -517,7 +546,11 @@ static void udp_stream_update(void *data, obs_data_t *settings)
 	std::string new_ip = obs_data_get_string(settings, "target_ip");
 	int new_port = (int)obs_data_get_int(settings, "target_port");
 
-	f->jpeg_quality = (int)obs_data_get_int(settings, "jpeg_quality");
+	{
+		// jpeg_quality is read by the encode thread - see net_mtx.
+		std::lock_guard<std::mutex> net_lock(f->net_mtx);
+		f->jpeg_quality = (int)obs_data_get_int(settings, "jpeg_quality");
+	}
 	f->max_fps = (int)obs_data_get_int(settings, "max_fps");
 	f->crop_anchor_x = (int)obs_data_get_int(settings, "crop_anchor_x");
 	f->crop_anchor_y = (int)obs_data_get_int(settings, "crop_anchor_y");
@@ -541,8 +574,11 @@ static void udp_stream_update(void *data, obs_data_t *settings)
 	f->target_ip = new_ip;
 	f->target_port = new_port;
 
+	// Socket lifecycle under net_mtx - the encode thread may be inside
+	// send_jpeg_chunked() on the old descriptor right now.
+	std::lock_guard<std::mutex> net_lock(f->net_mtx);
 	if (f->udp_enabled && (f->sock == INVALID_SOCKET || ip_or_port_changed)) {
-		setup_socket(f);
+		setup_socket_locked(f);
 	} else if (!f->udp_enabled && f->sock != INVALID_SOCKET) {
 		closesocket(f->sock);
 		f->sock = INVALID_SOCKET;

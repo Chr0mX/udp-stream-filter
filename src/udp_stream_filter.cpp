@@ -109,6 +109,11 @@ struct udp_stream_filter {
 	std::condition_variable enc_cv;
 	cv::Mat pending;
 	bool has_pending{false};
+	// Frames the capture thread overwrote before the encode thread took
+	// them, i.e. dropped because encoding couldn't keep up. Guarded by
+	// enc_mtx (written by the capture thread, read by the UI thread when
+	// properties are rebuilt).
+	uint64_t frames_dropped{0};
 
 	// Live-measured FPS of frames actually sent over UDP (i.e. what the
 	// receiver sees), independent of the Max FPS cap. Updated by the encode
@@ -404,6 +409,16 @@ static void capture_and_queue_frame(udp_stream_filter *f, obs_source_t *target, 
 			// straight to the encode thread instead.
 			{
 				std::lock_guard<std::mutex> lock(f->enc_mtx);
+				// Overwriting an untaken frame means the encoder
+				// couldn't keep up and that frame never reaches the
+				// wire. Latest-wins is the right policy for a realtime
+				// stream, but it was previously invisible: the only
+				// symptom was a measured_fps below Max FPS with nothing
+				// to attribute it to. Counting it separates "the
+				// encoder is the bottleneck" from "the capture gate is
+				// pacing us" -- two very different things to act on.
+				if (f->has_pending)
+					f->frames_dropped++;
 				f->pending = std::move(bgr);
 				f->has_pending = true;
 			}
@@ -645,12 +660,23 @@ static obs_properties_t *udp_stream_get_properties(void *data)
 		// Live status text, refreshed each time the properties are
 		// (re)built -- see the periodic obs_source_update_properties()
 		// call in encode_thread_func that keeps an open dialog current.
-		char fps_buf[64];
+		char fps_buf[128];
 		double fps = f->measured_fps.load();
-		if (f->udp_enabled && fps > 0.0)
-			snprintf(fps_buf, sizeof(fps_buf), "%.1f fps", fps);
-		else
+		uint64_t dropped;
+		{
+			std::lock_guard<std::mutex> lock(f->enc_mtx);
+			dropped = f->frames_dropped;
+		}
+		if (f->udp_enabled && fps > 0.0) {
+			if (dropped > 0)
+				snprintf(fps_buf, sizeof(fps_buf),
+					 "%.1f fps  (%llu frame(s) dropped -- encoder behind capture)",
+					 fps, (unsigned long long)dropped);
+			else
+				snprintf(fps_buf, sizeof(fps_buf), "%.1f fps", fps);
+		} else {
 			snprintf(fps_buf, sizeof(fps_buf), "-- (not streaming)");
+		}
 		obs_data_set_string(settings, "stream_fps_debug", fps_buf);
 
 		obs_data_release(settings);

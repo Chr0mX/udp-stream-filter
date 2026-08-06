@@ -45,6 +45,7 @@ static int WSAGetLastError()
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <utility> // std::move
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("xudp", "en-US")
@@ -275,7 +276,14 @@ static void encode_thread_func(udp_stream_filter *f)
 			if (!f->enc_running)
 				break;
 
-			frame = f->pending.clone();
+			// Move, don't clone. `pending` is dropped either way -
+			// has_pending goes false immediately below, and the capture
+			// thread assigns a whole new Mat next frame rather than
+			// writing into this one - so there is nothing left to
+			// protect by copying. Moving hands the allocation over and
+			// leaves `pending` empty, which the has_pending flag
+			// already represents.
+			frame = std::move(f->pending);
 			f->has_pending = false;
 			frame_id = (uint32_t)f->frames_sent;
 		}
@@ -388,11 +396,15 @@ static void capture_and_queue_frame(udp_stream_filter *f, obs_source_t *target, 
 
 			gs_stagesurface_unmap(f->stagesurface[read_idx]);
 
-			cv::Mat out_frame = bgr.clone();
-
+			// No clone here. cvtColor allocated `bgr` itself, so it
+			// already owns its pixels and does not alias mapped_data --
+			// the clone this replaced was copying a buffer that was
+			// already private, purely out of caution about the unmap
+			// above. Moving into `pending` hands that allocation
+			// straight to the encode thread instead.
 			{
 				std::lock_guard<std::mutex> lock(f->enc_mtx);
-				f->pending = out_frame;
+				f->pending = std::move(bgr);
 				f->has_pending = true;
 			}
 			f->enc_cv.notify_one();

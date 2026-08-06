@@ -162,13 +162,27 @@ static cv::Rect compute_capture_rect(int src_w, int src_h, udp_stream_filter *f)
 // UDP socket + chunked send
 // ---------------------------------------------------------------------------
 
-// Wire header for each UDP packet (16 bytes, all fields big-endian):
+// Wire header for each UDP packet (14 bytes, all fields big-endian):
 //   frame_id     (4 bytes) - increments per source frame, lets receiver detect drops/reorders
 //   total_size   (4 bytes) - total JPEG size in bytes across all chunks of this frame
 //   chunk_index  (2 bytes) - 0-based index of this chunk
 //   total_chunks (2 bytes) - total number of chunks for this frame
 //   chunk_size   (2 bytes) - payload bytes carried in this packet
-static const size_t UDP_HEADER_SIZE = 16;
+//
+// 4 + 4 + 2 + 2 + 2 = 14. This constant previously read 16 while the code
+// below wrote 14, and the comment above it claimed 16 too -- harmless only
+// because it is used solely to size the send buffer (so it over-allocated
+// by 2 bytes) and never as a write offset. Axiom's receiver has always
+// unpacked 14 (">IIHHH"), so the wire format itself was never in doubt;
+// the constant was just wrong about it, which is exactly the sort of thing
+// that bites whoever next reaches for it as an offset.
+//
+// PROTOCOL NOTE: there is no version field in this header, and adding one
+// now would break every deployed receiver. Any future change must stay
+// backward-compatible by construction -- append-only payload semantics, or
+// a new port. See Axiom's udp_receiver.py for the other half of this
+// contract; the two must be changed together.
+static const size_t UDP_HEADER_SIZE = 14;
 static const size_t UDP_MAX_PAYLOAD = 60000; // LAN-only: let IP fragmentation handle MTU,
 					     // most frames fit in 1-2 datagrams instead of ~45
 

@@ -118,6 +118,14 @@ struct udp_stream_filter {
 	int crop_anchor_x;
 	int crop_anchor_y;
 
+	bool enable_color_boost;
+	bool boost_yellow;
+	bool boost_purple;
+	bool boost_red;
+	float boost_str;
+	bool suppress_bg;
+	bool adaptive_boost;
+
 	// Guards sock/addr and every settings field above -- see the comment
 	// on the settings block itself. sock/addr specifically are written
 	// by OBS's UI thread in udp_stream_update() (a settings change can

@@ -88,6 +88,36 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Apply Release Tag Version 🏷️
+        if: github.ref_type == 'tag'
+        run: |
+          : Apply Release Tag Version 🏷️
+          if (( ${+RUNNER_DEBUG} )) setopt XTRACE
+
+          # buildspec.json's own "version" field is the single source every
+          # downstream step already reads (CMake's project(VERSION ...) via
+          # cmake/common/buildspec_common.cmake, and this job's own "Set Up
+          # Environment" step right below) -- so when this run was actually
+          # triggered by a real release tag, overwrite it here, once, before
+          # anything else runs, instead of requiring buildspec.json to have
+          # been hand-bumped to match the tag beforehand. That hand-bump was
+          # a real, previously-shipped drift (installer.iss's own version
+          # string once fell out of sync with buildspec.json's) -- this
+          # closes it at the source instead of relying on someone
+          # remembering to keep the two in sync.
+          local tag="${GITHUB_REF_NAME}"
+          if [[ ! "${tag}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)[0-9]*)?$ ]]; then
+            print "::warning::Tag '${tag}' does not look like a plugin version (expected e.g. 1.0.9 or 1.0.9-beta1) -- leaving buildspec.json's version as-is."
+          else
+            local current
+            current="$(jq -r '.version' buildspec.json)"
+            if [[ "${current}" != "${tag}" ]]; then
+              print "Overriding buildspec.json version '${current}' with release tag '${tag}'"
+              jq --arg v "${tag}" '.version = $v' buildspec.json > buildspec.json.tmp
+              mv buildspec.json.tmp buildspec.json
+            fi
+          fi
+
       - name: Set Up Environment 🔧
         id: setup
         run: |
@@ -198,6 +228,30 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Apply Release Tag Version 🏷️
+        if: github.ref_type == 'tag'
+        run: |
+          : Apply Release Tag Version 🏷️
+          if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
+
+          # See the equivalent step in the macos-build job for why this
+          # rewrites buildspec.json itself rather than exporting a
+          # GITHUB_OUTPUT: every downstream consumer (CMake, this job's own
+          # "Set Up Environment" step) already reads the version from that
+          # file, so patching it once here is what actually makes it "the
+          # single source of truth" rather than adding a second one.
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "${tag}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)[0-9]*)?$ ]]; then
+            echo "::warning::Tag '${tag}' does not look like a plugin version (expected e.g. 1.0.9 or 1.0.9-beta1) -- leaving buildspec.json's version as-is."
+          else
+            current="$(jq -r '.version' buildspec.json)"
+            if [[ "${current}" != "${tag}" ]]; then
+              echo "Overriding buildspec.json version '${current}' with release tag '${tag}'"
+              jq --arg v "${tag}" '.version = $v' buildspec.json > buildspec.json.tmp
+              mv buildspec.json.tmp buildspec.json
+            fi
+          fi
+
       - name: Set Up Environment 🔧
         id: setup
         run: |
@@ -271,6 +325,45 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+
+      - name: Apply Release Tag Version 🏷️
+        if: github.ref_type == 'tag'
+        run: |
+          # Apply Release Tag Version 🏷️
+          if ( $Env:RUNNER_DEBUG -ne $null ) {
+            Set-PSDebug -Trace 1
+          }
+
+          # buildspec.json's own "version" field is the single source every
+          # downstream step already reads: CMake's project(VERSION ...) (via
+          # cmake/common/buildspec_common.cmake, at configure time inside
+          # Build-Windows.ps1), and Package-Windows.ps1's own $ProductVersion
+          # -- which is what actually becomes the installer's
+          # /DPluginVersion= define passed to ISCC. So when this run was
+          # actually triggered by a real release tag, overwrite it here,
+          # once, before anything else runs, instead of requiring
+          # buildspec.json to have been hand-bumped to match the tag
+          # beforehand. That hand-bump was a real, previously-shipped drift
+          # -- installer.iss's own hardcoded version string once fell out of
+          # sync with buildspec.json's -- and patching buildspec.json here is
+          # what actually closes it at the source, since every consumer
+          # already reads from this one file rather than from a GitHub
+          # Actions output this step could otherwise export instead.
+          $Tag = "${{ github.ref_name }}"
+          if ( $Tag -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)[0-9]*)?$' ) {
+            Write-Warning "Tag '${Tag}' does not look like a plugin version (expected e.g. 1.0.9 or 1.0.9-beta1) -- leaving buildspec.json's version as-is."
+          } else {
+            $BuildSpecPath = 'buildspec.json'
+            $BuildSpec = Get-Content -Path $BuildSpecPath -Raw | ConvertFrom-Json
+            if ( $BuildSpec.version -ne $Tag ) {
+              Write-Host "Overriding buildspec.json version '$($BuildSpec.version)' with release tag '${Tag}'"
+              $BuildSpec.version = $Tag
+              # -Depth 10 so nested objects (dependencies/platformConfig)
+              # round-trip intact rather than ConvertTo-Json's low default
+              # depth (2) silently flattening them to "@{...}" strings.
+              $BuildSpec | ConvertTo-Json -Depth 10 | Set-Content -Path $BuildSpecPath
+            }
+          }
 
       - name: Set Up Environment 🔧
         id: setup

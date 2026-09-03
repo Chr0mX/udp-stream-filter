@@ -57,6 +57,19 @@ set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES MSVC_RUNTIME_LIBRARY "Mul
 
 # NOTE: replace src/plugin-main.c with your plugin source file and update
 # this line to match its filename.
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/udp_stream_filter.cpp)
+# udp_stream_filter.cpp holds the OBS module entry points and the filter's
+# create/destroy/update/video_render lifecycle; the render-thread capture +
+# encode-thread pipeline, the UDP socket/wire-protocol send path, and the
+# Filters-dialog properties UI each live in their own translation unit -- see
+# src/udp_stream_filter.h for the struct and the declarations shared across
+# them.
+target_sources(
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE src/udp_stream_filter.cpp
+          src/udp_stream_capture.cpp
+          src/udp_stream_net.cpp
+          src/udp_stream_properties.cpp
+          src/udp_stream_filter.h
+)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

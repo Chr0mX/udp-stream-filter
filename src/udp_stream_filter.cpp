@@ -1,447 +1,15 @@
-#include <obs-module.h>
-#include <obs-source.h>
-#include <graphics/graphics.h>
-#include <util/platform.h>
-
-#include <opencv2/core.hpp>
-#include <opencv2/imgcodecs.hpp>
-#include <opencv2/imgproc.hpp>
-
-#ifdef _WIN32
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#pragma comment(lib, "ws2_32.lib")
-#undef min
-#undef max
-#else
-#include <arpa/inet.h>
-#include <cerrno>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-typedef int SOCKET;
-static const SOCKET INVALID_SOCKET = -1;
-static const int SOCKET_ERROR = -1;
-#define closesocket(s) close(s)
-static int WSAGetLastError()
-{
-	return errno;
-}
-#endif
-
-#include <thread>
-#include <mutex>
-#include <atomic>
-#include <chrono>
-#include <string>
-#include <condition_variable>
-#include <vector>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <algorithm>
-#include <utility> // std::move
+// udp_stream_filter.cpp -- OBS module entry points and the filter's own
+// lifecycle/settings callbacks. The per-frame render path, the socket/wire
+// protocol, and the properties UI now live in their own translation units
+// (udp_stream_capture.cpp / udp_stream_net.cpp / udp_stream_properties.cpp)
+// -- see udp_stream_filter.h for the struct definition and the declarations
+// shared across them.
+#include "udp_stream_filter.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("xudp", "en-US")
 
 static void udp_stream_update(void *data, obs_data_t *settings);
-
-struct udp_stream_filter {
-	obs_source_t *source;
-	gs_texrender_t *texrender;
-
-	// Double-buffered GPU->CPU readback: gs_stage_texture() queues an async
-	// GPU copy into the "write" buffer, then the previous frame's "read"
-	// buffer (staged last call, and by now finished on the GPU) is mapped
-	// -- so gs_stagesurface_map() never has to block waiting for the
-	// current frame's copy to complete. Costs one frame of latency but
-	// removes the per-frame GPU pipeline stall that was capping FPS well
-	// below both the canvas rate and the Max FPS setting.
-	gs_stagesurf_t *stagesurface[2];
-	uint32_t stage_width[2];
-	uint32_t stage_height[2];
-	bool stage_valid[2];
-	int stage_write_idx;
-
-	bool udp_enabled;
-	std::string target_ip;
-	int target_port;
-	int jpeg_quality;
-	int max_fps;
-	bool crop_enabled;
-	int output_preset;
-	int crop_width;
-	int crop_height;
-	int crop_anchor_x;
-	int crop_anchor_y;
-
-	bool enable_color_boost;
-	bool boost_yellow;
-	bool boost_purple;
-	bool boost_red;
-	float boost_str;
-	bool suppress_bg;
-	bool adaptive_boost;
-
-	// Guards sock/addr/jpeg_quality, which are written by OBS's UI thread in
-	// udp_stream_update() (a settings change can close and recreate the
-	// socket) and read by the encode thread in send_jpeg_chunked(). Without
-	// it, changing Target IP or Port mid-stream could have the encode thread
-	// call sendto() on a descriptor the UI thread had just closed, or read a
-	// sockaddr while memset()/inet_pton() were half-way through rewriting it.
-	// enc_mtx does NOT cover this - it only guards the pending frame handoff.
-	std::mutex net_mtx;
-	SOCKET sock;
-	sockaddr_in addr;
-	std::chrono::steady_clock::time_point last_send;
-	int frames_sent;
-	bool first_sent;
-
-	std::thread enc_thread;
-	std::atomic<bool> enc_running{false};
-	std::mutex enc_mtx;
-	std::condition_variable enc_cv;
-	cv::Mat pending;
-	bool has_pending{false};
-	// Frames the capture thread overwrote before the encode thread took
-	// them, i.e. dropped because encoding couldn't keep up. Guarded by
-	// enc_mtx (written by the capture thread, read by the UI thread when
-	// properties are rebuilt).
-	uint64_t frames_dropped{0};
-
-	// Live-measured FPS of frames actually sent over UDP (i.e. what the
-	// receiver sees), independent of the Max FPS cap. Updated by the encode
-	// thread roughly once per second; read from the UI thread when the
-	// filter's properties are (re)built.
-	std::atomic<double> measured_fps{0.0};
-	std::chrono::steady_clock::time_point fps_window_start;
-	int fps_window_count = 0;
-	std::chrono::steady_clock::time_point last_ui_refresh;
-};
-
-// ---------------------------------------------------------------------------
-// Native pixel crop (no resize/interpolation)
-// ---------------------------------------------------------------------------
-
-// Computes the source-space capture rectangle: crop_width x crop_height
-// anchored at (crop_anchor_x, crop_anchor_y) when cropping is enabled (or
-// centered when either anchor coordinate is negative, the default), or the
-// full source frame otherwise. The size is clamped to the source frame's
-// dimensions rather than erroring or padding.
-//
-// This is used to size the GPU texrender/stagesurface for capture itself,
-// so capture only ever reads back the pixels actually needed -- not the
-// full source frame -- which is what makes high FPS (e.g. 120fps) with a
-// small crop achievable: the GPU->CPU readback (gs_stagesurface_map) and
-// color conversion cost scale with the crop size, not the source size.
-static cv::Rect compute_capture_rect(int src_w, int src_h, udp_stream_filter *f)
-{
-	if (!f->crop_enabled)
-		return cv::Rect(0, 0, src_w, src_h);
-
-	int crop_w = std::max(1, std::min(f->crop_width, src_w));
-	int crop_h = std::max(1, std::min(f->crop_height, src_h));
-
-	int left = f->crop_anchor_x >= 0 ? f->crop_anchor_x : (src_w - crop_w) / 2;
-	int top = f->crop_anchor_y >= 0 ? f->crop_anchor_y : (src_h - crop_h) / 2;
-
-	// Clamp so the capture rect stays fully inside the source frame.
-	left = std::max(0, std::min(left, src_w - crop_w));
-	top = std::max(0, std::min(top, src_h - crop_h));
-
-	return cv::Rect(left, top, crop_w, crop_h);
-}
-
-// ---------------------------------------------------------------------------
-// UDP socket + chunked send
-// ---------------------------------------------------------------------------
-
-// Wire header for each UDP packet (14 bytes, all fields big-endian):
-//   frame_id     (4 bytes) - increments per source frame, lets receiver detect drops/reorders
-//   total_size   (4 bytes) - total JPEG size in bytes across all chunks of this frame
-//   chunk_index  (2 bytes) - 0-based index of this chunk
-//   total_chunks (2 bytes) - total number of chunks for this frame
-//   chunk_size   (2 bytes) - payload bytes carried in this packet
-//
-// 4 + 4 + 2 + 2 + 2 = 14. This constant previously read 16 while the code
-// below wrote 14, and the comment above it claimed 16 too -- harmless only
-// because it is used solely to size the send buffer (so it over-allocated
-// by 2 bytes) and never as a write offset. Axiom's receiver has always
-// unpacked 14 (">IIHHH"), so the wire format itself was never in doubt;
-// the constant was just wrong about it, which is exactly the sort of thing
-// that bites whoever next reaches for it as an offset.
-//
-// PROTOCOL NOTE: there is no version field in this header, and adding one
-// now would break every deployed receiver. Any future change must stay
-// backward-compatible by construction -- append-only payload semantics, or
-// a new port. See Axiom's udp_receiver.py for the other half of this
-// contract; the two must be changed together.
-static const size_t UDP_HEADER_SIZE = 14;
-static const size_t UDP_MAX_PAYLOAD = 60000; // LAN-only: let IP fragmentation handle MTU,
-					     // most frames fit in 1-2 datagrams instead of ~45
-
-// Caller must hold f->net_mtx.
-static bool setup_socket_locked(udp_stream_filter *f)
-{
-	if (f->sock != INVALID_SOCKET) {
-		closesocket(f->sock);
-		f->sock = INVALID_SOCKET;
-	}
-
-	f->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (f->sock == INVALID_SOCKET) {
-		blog(LOG_ERROR, "[xudp] failed to create socket: %d", WSAGetLastError());
-		return false;
-	}
-
-	memset(&f->addr, 0, sizeof(f->addr));
-	f->addr.sin_family = AF_INET;
-	f->addr.sin_port = htons((u_short)f->target_port);
-
-	if (inet_pton(AF_INET, f->target_ip.c_str(), &f->addr.sin_addr) != 1) {
-		blog(LOG_ERROR, "[xudp] invalid target IP: %s", f->target_ip.c_str());
-		closesocket(f->sock);
-		f->sock = INVALID_SOCKET;
-		return false;
-	}
-
-	// Larger send buffer so bursts of big (multi-chunk) frames don't get
-	// dropped at the socket layer before reaching the wire.
-	int sndbuf = 1 * 1024 * 1024;
-	setsockopt(f->sock, SOL_SOCKET, SO_SNDBUF, (const char *)&sndbuf, sizeof(sndbuf));
-
-	return true;
-}
-
-static void send_jpeg_chunked(udp_stream_filter *f, const uint8_t *jpeg, unsigned long jpeg_size, uint32_t frame_id)
-{
-	if (jpeg_size == 0)
-		return;
-
-	// Held across the whole send so the UI thread can't close the socket or
-	// rewrite the destination address between chunks of one frame. sendto()
-	// on a UDP socket only copies into the socket buffer and returns, so
-	// this never blocks the UI thread for meaningfully long - and a settings
-	// change waiting out one frame's worth of chunks is the correct
-	// trade against sending on a closed descriptor.
-	std::lock_guard<std::mutex> net_lock(f->net_mtx);
-
-	if (f->sock == INVALID_SOCKET)
-		return;
-
-	uint16_t total_chunks = (uint16_t)((jpeg_size + UDP_MAX_PAYLOAD - 1) / UDP_MAX_PAYLOAD);
-	if (total_chunks == 0)
-		total_chunks = 1;
-
-	std::vector<uint8_t> packet(UDP_HEADER_SIZE + UDP_MAX_PAYLOAD);
-	size_t offset = 0;
-
-	for (uint16_t i = 0; i < total_chunks; i++) {
-		size_t remaining = jpeg_size - offset;
-		size_t this_size = std::min(remaining, UDP_MAX_PAYLOAD);
-
-		uint32_t n_frame_id = htonl(frame_id);
-		uint32_t n_total_size = htonl((uint32_t)jpeg_size);
-		uint16_t n_chunk_index = htons(i);
-		uint16_t n_total_chunks = htons(total_chunks);
-		uint16_t n_chunk_size = htons((uint16_t)this_size);
-
-		size_t p = 0;
-		memcpy(&packet[p], &n_frame_id, 4);
-		p += 4;
-		memcpy(&packet[p], &n_total_size, 4);
-		p += 4;
-		memcpy(&packet[p], &n_chunk_index, 2);
-		p += 2;
-		memcpy(&packet[p], &n_total_chunks, 2);
-		p += 2;
-		memcpy(&packet[p], &n_chunk_size, 2);
-		p += 2;
-		memcpy(&packet[p], jpeg + offset, this_size);
-		p += this_size;
-
-		int sent = sendto(f->sock, (const char *)packet.data(), (int)p, 0, (const sockaddr *)&f->addr,
-				  sizeof(f->addr));
-
-		if (sent == SOCKET_ERROR) {
-			blog(LOG_WARNING, "[xudp] sendto failed: %d", WSAGetLastError());
-			break;
-		}
-
-		offset += this_size;
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Background JPEG encode thread
-// ---------------------------------------------------------------------------
-
-static void encode_thread_func(udp_stream_filter *f)
-{
-	while (f->enc_running) {
-		cv::Mat frame;
-		uint32_t frame_id;
-
-		{
-			std::unique_lock<std::mutex> lock(f->enc_mtx);
-			f->enc_cv.wait(lock, [f] { return f->has_pending || !f->enc_running; });
-
-			if (!f->enc_running)
-				break;
-
-			// Move, don't clone. `pending` is dropped either way -
-			// has_pending goes false immediately below, and the capture
-			// thread assigns a whole new Mat next frame rather than
-			// writing into this one - so there is nothing left to
-			// protect by copying. Moving hands the allocation over and
-			// leaves `pending` empty, which the has_pending flag
-			// already represents.
-			frame = std::move(f->pending);
-			f->has_pending = false;
-			frame_id = (uint32_t)f->frames_sent;
-		}
-
-		if (frame.empty())
-			continue;
-
-		// Snapshot under the lock - jpeg_quality is written by the UI
-		// thread in udp_stream_update(). Copied out rather than held so
-		// the (comparatively slow) imencode below runs unlocked.
-		int quality;
-		{
-			std::lock_guard<std::mutex> net_lock(f->net_mtx);
-			quality = f->jpeg_quality;
-		}
-
-		std::vector<uchar> jpeg_buf;
-		std::vector<int> encode_params = {cv::IMWRITE_JPEG_QUALITY, quality};
-
-		if (cv::imencode(".jpg", frame, jpeg_buf, encode_params) && !jpeg_buf.empty()) {
-			send_jpeg_chunked(f, jpeg_buf.data(), (unsigned long)jpeg_buf.size(), frame_id);
-			f->frames_sent++;
-
-			// Recompute the measured send FPS about once per second for
-			// accuracy, but only nudge the UI to refresh every few
-			// seconds -- obs_source_update_properties() rebuilds the
-			// whole Filters properties dialog, which fights typing/
-			// clicking in other fields (e.g. Max FPS) if done too often.
-			f->fps_window_count++;
-			auto now = std::chrono::steady_clock::now();
-			double elapsed = std::chrono::duration<double>(now - f->fps_window_start).count();
-			if (elapsed >= 1.0) {
-				f->measured_fps = f->fps_window_count / elapsed;
-				f->fps_window_count = 0;
-				f->fps_window_start = now;
-
-				double since_ui_refresh =
-					std::chrono::duration<double>(now - f->last_ui_refresh).count();
-				if (since_ui_refresh >= 4.0) {
-					f->last_ui_refresh = now;
-					obs_source_update_properties(f->source);
-				}
-			}
-		} else {
-			blog(LOG_WARNING, "[xudp] JPEG compression failed");
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Frame capture (GPU texture -> CPU Mat) and queueing
-// ---------------------------------------------------------------------------
-
-static void capture_and_queue_frame(udp_stream_filter *f, obs_source_t *target, uint32_t src_width, uint32_t src_height)
-{
-	cv::Rect capture_rect = compute_capture_rect((int)src_width, (int)src_height, f);
-	uint32_t width = (uint32_t)capture_rect.width;
-	uint32_t height = (uint32_t)capture_rect.height;
-
-	gs_texrender_reset(f->texrender);
-
-	if (!gs_texrender_begin(f->texrender, width, height))
-		return;
-
-	struct vec4 clear_color;
-	vec4_zero(&clear_color);
-	gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
-	// Ortho bounds are the capture rect in source space, not [0,width]x[0,height]:
-	// mapping just that sub-rect onto the full (width x height) viewport captures
-	// exactly those source pixels at 1:1 scale -- a GPU-side crop with no resize,
-	// and critically, no readback of the full source frame when cropping is on.
-	gs_ortho((float)capture_rect.x, (float)(capture_rect.x + capture_rect.width), (float)capture_rect.y,
-		 (float)(capture_rect.y + capture_rect.height), -100.0f, 100.0f);
-
-	obs_source_video_render(target);
-
-	gs_texrender_end(f->texrender);
-
-	gs_texture_t *tex = gs_texrender_get_texture(f->texrender);
-	if (!tex)
-		return;
-
-	int write_idx = f->stage_write_idx;
-	int read_idx = 1 - write_idx;
-
-	if (!f->stagesurface[write_idx] || f->stage_width[write_idx] != width || f->stage_height[write_idx] != height) {
-		if (f->stagesurface[write_idx])
-			gs_stagesurface_destroy(f->stagesurface[write_idx]);
-		f->stagesurface[write_idx] = gs_stagesurface_create(width, height, GS_BGRA);
-		f->stage_width[write_idx] = width;
-		f->stage_height[write_idx] = height;
-		f->stage_valid[write_idx] = false;
-	}
-
-	// Queue this frame's GPU->CPU copy; it completes asynchronously and is
-	// only mapped on a *later* call (see below), so this never blocks.
-	gs_stage_texture(f->stagesurface[write_idx], tex);
-	f->stage_valid[write_idx] = true;
-
-	// Read back the other buffer's copy, staged on a previous call -- by
-	// now the GPU has had at least one full frame to finish it, so this
-	// map should return immediately instead of stalling.
-	if (f->stage_valid[read_idx] && f->stage_width[read_idx] == width && f->stage_height[read_idx] == height) {
-		uint8_t *mapped_data = nullptr;
-		uint32_t linesize = 0;
-		if (gs_stagesurface_map(f->stagesurface[read_idx], &mapped_data, &linesize)) {
-			cv::Mat bgra((int)height, (int)width, CV_8UC4, mapped_data, linesize);
-			cv::Mat bgr;
-			cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
-
-			gs_stagesurface_unmap(f->stagesurface[read_idx]);
-
-			// No clone here. cvtColor allocated `bgr` itself, so it
-			// already owns its pixels and does not alias mapped_data --
-			// the clone this replaced was copying a buffer that was
-			// already private, purely out of caution about the unmap
-			// above. Moving into `pending` hands that allocation
-			// straight to the encode thread instead.
-			{
-				std::lock_guard<std::mutex> lock(f->enc_mtx);
-				// Overwriting an untaken frame means the encoder
-				// couldn't keep up and that frame never reaches the
-				// wire. Latest-wins is the right policy for a realtime
-				// stream, but it was previously invisible: the only
-				// symptom was a measured_fps below Max FPS with nothing
-				// to attribute it to. Counting it separates "the
-				// encoder is the bottleneck" from "the capture gate is
-				// pacing us" -- two very different things to act on.
-				if (f->has_pending)
-					f->frames_dropped++;
-				f->pending = std::move(bgr);
-				f->has_pending = true;
-			}
-			f->enc_cv.notify_one();
-		}
-	}
-
-	f->stage_write_idx = read_idx;
-}
 
 // ---------------------------------------------------------------------------
 // OBS filter callbacks
@@ -459,7 +27,22 @@ static void udp_stream_video_render(void *data, gs_effect_t *effect)
 	udp_stream_filter *f = (udp_stream_filter *)data;
 
 	obs_source_t *target = obs_filter_get_target(f->source);
-	if (!target || !f->udp_enabled) {
+
+	// Snapshot udp_enabled/max_fps under net_mtx instead of reading
+	// f->udp_enabled/f->max_fps directly -- both are written by
+	// udp_stream_update() (the settings-update callback) as part of one
+	// locked group, and this render-thread read must join that same
+	// group instead of racing it. See udp_stream_filter.h's comment on
+	// the settings block.
+	bool udp_enabled;
+	int max_fps;
+	{
+		std::lock_guard<std::mutex> net_lock(f->net_mtx);
+		udp_enabled = f->udp_enabled;
+		max_fps = f->max_fps;
+	}
+
+	if (!target || !udp_enabled) {
 		obs_source_skip_video_filter(f->source);
 		return;
 	}
@@ -474,10 +57,10 @@ static void udp_stream_video_render(void *data, gs_effect_t *effect)
 
 	bool should_capture = true;
 
-	if (f->max_fps > 0) {
+	if (max_fps > 0) {
 		auto now = std::chrono::steady_clock::now();
 		auto min_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-			std::chrono::duration<double>(1.0 / (double)f->max_fps));
+			std::chrono::duration<double>(1.0 / (double)max_fps));
 
 		if (!f->first_sent) {
 			f->last_send = now;
@@ -563,140 +146,74 @@ static void udp_stream_destroy(void *data)
 	delete f;
 }
 
-static void udp_stream_get_defaults(obs_data_t *settings)
-{
-	obs_data_set_default_bool(settings, "udp_enabled", true);
-	obs_data_set_default_string(settings, "target_ip", "127.0.0.1");
-	obs_data_set_default_int(settings, "target_port", 5600);
-	obs_data_set_default_int(settings, "jpeg_quality", 80);
-	obs_data_set_default_int(settings, "max_fps", 0);
-	obs_data_set_default_bool(settings, "crop_enabled", false);
-	obs_data_set_default_int(settings, "output_preset", 0);
-	obs_data_set_default_int(settings, "crop_width", 320);
-	obs_data_set_default_int(settings, "crop_height", 320);
-	obs_data_set_default_int(settings, "crop_anchor_x", -1);
-	obs_data_set_default_int(settings, "crop_anchor_y", -1);
-}
-
 static void udp_stream_update(void *data, obs_data_t *settings)
 {
 	udp_stream_filter *f = (udp_stream_filter *)data;
 
-	f->udp_enabled = obs_data_get_bool(settings, "udp_enabled");
-
+	// Read every setting into a local first -- none of this needs a lock,
+	// it's just obs_data_t access -- then take net_mtx exactly once below
+	// to publish the whole group atomically. This replaces the previous
+	// field-by-field unlocked writes (with only jpeg_quality individually
+	// guarded): the render thread reads several of these fields every
+	// frame (see udp_stream_video_render()/capture_and_queue_frame()), so
+	// writing them unlocked was a real, if practically benign on x86/x64,
+	// data race -- and the five crop-rect fields specifically must change
+	// together as one group or a reader can observe a torn mix of old and
+	// new values.
+	bool new_udp_enabled = obs_data_get_bool(settings, "udp_enabled");
 	std::string new_ip = obs_data_get_string(settings, "target_ip");
 	int new_port = (int)obs_data_get_int(settings, "target_port");
+	int new_jpeg_quality = (int)obs_data_get_int(settings, "jpeg_quality");
+	int new_max_fps = (int)obs_data_get_int(settings, "max_fps");
+	int new_crop_anchor_x = (int)obs_data_get_int(settings, "crop_anchor_x");
+	int new_crop_anchor_y = (int)obs_data_get_int(settings, "crop_anchor_y");
+	int new_output_preset = (int)obs_data_get_int(settings, "output_preset");
 
-	{
-		// jpeg_quality is read by the encode thread - see net_mtx.
-		std::lock_guard<std::mutex> net_lock(f->net_mtx);
-		f->jpeg_quality = (int)obs_data_get_int(settings, "jpeg_quality");
-	}
-	f->max_fps = (int)obs_data_get_int(settings, "max_fps");
-	f->crop_anchor_x = (int)obs_data_get_int(settings, "crop_anchor_x");
-	f->crop_anchor_y = (int)obs_data_get_int(settings, "crop_anchor_y");
+	int preset_size = new_output_preset == 1 ? 320 : new_output_preset == 2 ? 640 : 0;
 
-	f->output_preset = (int)obs_data_get_int(settings, "output_preset");
-	int preset_size = f->output_preset == 1 ? 320 : f->output_preset == 2 ? 640 : 0;
-
+	bool new_crop_enabled;
+	int new_crop_width;
+	int new_crop_height;
 	if (preset_size > 0) {
 		// Presets force a native square crop at the given size; the
 		// anchor remains user-adjustable (defaults to center).
-		f->crop_enabled = true;
-		f->crop_width = preset_size;
-		f->crop_height = preset_size;
+		new_crop_enabled = true;
+		new_crop_width = preset_size;
+		new_crop_height = preset_size;
 	} else {
-		f->crop_enabled = obs_data_get_bool(settings, "crop_enabled");
-		f->crop_width = (int)obs_data_get_int(settings, "crop_width");
-		f->crop_height = (int)obs_data_get_int(settings, "crop_height");
+		new_crop_enabled = obs_data_get_bool(settings, "crop_enabled");
+		new_crop_width = (int)obs_data_get_int(settings, "crop_width");
+		new_crop_height = (int)obs_data_get_int(settings, "crop_height");
 	}
+
+	// Everything from here down is one locked group: the settings fields
+	// themselves, plus the socket lifecycle (which depends on whether
+	// udp_enabled/target_ip/target_port changed) -- the encode thread may
+	// be inside send_jpeg_chunked() on the old socket/address right now,
+	// so both the field writes and the socket teardown/setup need to be
+	// atomic with respect to it.
+	std::lock_guard<std::mutex> net_lock(f->net_mtx);
+
+	f->udp_enabled = new_udp_enabled;
+	f->jpeg_quality = new_jpeg_quality;
+	f->max_fps = new_max_fps;
+	f->crop_anchor_x = new_crop_anchor_x;
+	f->crop_anchor_y = new_crop_anchor_y;
+	f->output_preset = new_output_preset;
+	f->crop_enabled = new_crop_enabled;
+	f->crop_width = new_crop_width;
+	f->crop_height = new_crop_height;
 
 	bool ip_or_port_changed = (new_ip != f->target_ip) || (new_port != f->target_port);
 	f->target_ip = new_ip;
 	f->target_port = new_port;
 
-	// Socket lifecycle under net_mtx - the encode thread may be inside
-	// send_jpeg_chunked() on the old descriptor right now.
-	std::lock_guard<std::mutex> net_lock(f->net_mtx);
 	if (f->udp_enabled && (f->sock == INVALID_SOCKET || ip_or_port_changed)) {
 		setup_socket_locked(f);
 	} else if (!f->udp_enabled && f->sock != INVALID_SOCKET) {
 		closesocket(f->sock);
 		f->sock = INVALID_SOCKET;
 	}
-}
-
-// Grays out the manual crop enable/size controls whenever a standard
-// output preset (320x320 / 640x640) is active, since their effective
-// values are then dictated by the preset rather than user input. The
-// anchor stays editable in all cases.
-static bool udp_stream_preset_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
-{
-	UNUSED_PARAMETER(property);
-	bool is_preset = obs_data_get_int(settings, "output_preset") != 0;
-
-	obs_property_set_enabled(obs_properties_get(props, "crop_enabled"), !is_preset);
-	obs_property_set_enabled(obs_properties_get(props, "crop_width"), !is_preset);
-	obs_property_set_enabled(obs_properties_get(props, "crop_height"), !is_preset);
-
-	return true;
-}
-
-static obs_properties_t *udp_stream_get_properties(void *data)
-{
-	obs_properties_t *props = obs_properties_create();
-
-	obs_properties_add_bool(props, "udp_enabled", "Enable UDP Streaming");
-	obs_properties_add_text(props, "target_ip", "Target IP", OBS_TEXT_DEFAULT);
-	obs_properties_add_int(props, "target_port", "Target Port", 1, 65535, 1);
-	obs_properties_add_int_slider(props, "jpeg_quality", "JPEG Quality", 1, 100, 1);
-	obs_properties_add_int(props, "max_fps", "Max FPS (0 = uncapped)", 0, 240, 1);
-	obs_properties_add_text(props, "stream_fps_debug", "Current Stream FPS (measured)", OBS_TEXT_INFO);
-
-	obs_property_t *preset_list = obs_properties_add_list(props, "output_preset", "Output Preset",
-							      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(preset_list, "Custom", 0);
-	obs_property_list_add_int(preset_list, "320x320", 1);
-	obs_property_list_add_int(preset_list, "640x640", 2);
-	obs_property_set_modified_callback(preset_list, udp_stream_preset_modified);
-
-	obs_properties_add_bool(props, "crop_enabled", "Enable Crop");
-	obs_properties_add_int(props, "crop_width", "Crop Width (px)", 1, 7680, 1);
-	obs_properties_add_int(props, "crop_height", "Crop Height (px)", 1, 4320, 1);
-	obs_properties_add_int(props, "crop_anchor_x", "Crop Anchor X, px (-1 = center)", -1, 7680, 1);
-	obs_properties_add_int(props, "crop_anchor_y", "Crop Anchor Y, px (-1 = center)", -1, 4320, 1);
-
-	if (data) {
-		udp_stream_filter *f = (udp_stream_filter *)data;
-		obs_data_t *settings = obs_source_get_settings(f->source);
-		udp_stream_preset_modified(props, preset_list, settings);
-
-		// Live status text, refreshed each time the properties are
-		// (re)built -- see the periodic obs_source_update_properties()
-		// call in encode_thread_func that keeps an open dialog current.
-		char fps_buf[128];
-		double fps = f->measured_fps.load();
-		uint64_t dropped;
-		{
-			std::lock_guard<std::mutex> lock(f->enc_mtx);
-			dropped = f->frames_dropped;
-		}
-		if (f->udp_enabled && fps > 0.0) {
-			if (dropped > 0)
-				snprintf(fps_buf, sizeof(fps_buf),
-					 "%.1f fps  (%llu frame(s) dropped -- encoder behind capture)",
-					 fps, (unsigned long long)dropped);
-			else
-				snprintf(fps_buf, sizeof(fps_buf), "%.1f fps", fps);
-		} else {
-			snprintf(fps_buf, sizeof(fps_buf), "-- (not streaming)");
-		}
-		obs_data_set_string(settings, "stream_fps_debug", fps_buf);
-
-		obs_data_release(settings);
-	}
-
-	return props;
 }
 
 // ---------------------------------------------------------------------------

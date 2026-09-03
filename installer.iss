@@ -12,10 +12,37 @@
 ;   1. Open this file in the Inno Setup Compiler (or run ISCC.exe installer.iss)
 ;   2. Output .exe appears in installer_output\
 
-#define PluginName "Colour"     ; must exactly match buildspec.json "name"
+; PluginName/PluginVersion/RundirConfig are all passed in by CI via ISCC's
+; /D command line switch (Package-Windows.ps1) -- but a plain, unconditional
+; #define here would silently win over that anyway, since Inno Setup
+; Preprocessor treats a /D switch as if it were the first line of the
+; script, and a later #define for the same name is a plain (silent, no
+; warning) redefinition. That was a real, undiscovered bug: every CI build
+; had its /DPluginVersion=/DPluginName= command-line overrides quietly
+; discarded in favor of whatever was hardcoded below, and only the CMake
+; side (buildspec.json's own version, consumed independently) ever actually
+; followed a release tag. Guarding each with #ifndef makes the hardcoded
+; value a fallback for a manual/local ISCC run with no /D switches, while
+; letting CI's actual command-line values take effect as intended.
+#ifndef PluginName
+  #define PluginName "Colour"     ; must exactly match buildspec.json "name"
+#endif
 #define PluginDisplayName "Colour"
-#define PluginVersion "1.0.8"              ; must match buildspec.json "version"
-#define RundirConfig "RelWithDebInfo"      ; matches the CMake preset's build configuration
+#ifndef PluginVersion
+  #define PluginVersion "1.0.8"              ; must match buildspec.json "version"
+#endif
+#ifndef RundirConfig
+  ; Matches the CMake preset's build configuration for a normal (non-tag)
+  ; CI build. A version-tag-triggered release build instead compiles in
+  ; "Release" config (see build-project.yaml's check-event job), which
+  ; Package-Windows.ps1 now passes through as /DRundirConfig=Release --
+  ; this default only applies when that override isn't supplied (e.g. a
+  ; manual local build). Without this override, a real tagged-release build
+  ; always failed here: ISCC would still look for the DLL under
+  ; build_x64\rundir\RelWithDebInfo\ even though the actual build placed it
+  ; under the Release config folder instead.
+  #define RundirConfig "RelWithDebInfo"
+#endif
 ; NOTE: this build's post-build step copies the DLL/PDB flat into
 ; rundir\<config>\, and only the data/ folder contents into a
 ; rundir\<config>\<name>\ subfolder. Confirmed directly from the verbose

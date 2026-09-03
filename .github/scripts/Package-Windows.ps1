@@ -89,7 +89,13 @@ function Package {
             throw "Inno Setup (ISCC.exe) was not found. Install it from https://jrsoftware.org/isinfo.php or via 'choco install innosetup'."
         }
 
-        Invoke-External $Iscc "/DPluginName=${ProductName}" "/DPluginVersion=${ProductVersion}" "${ProjectRoot}/installer.iss"
+        # RundirConfig must match the build's actual configuration -- a
+        # version-tag-triggered release build compiles in "Release" rather
+        # than the usual "RelWithDebInfo" (see build-project.yaml's
+        # check-event job), and installer.iss has no way to know that on
+        # its own. Without this, ISCC looks for the built DLL under the
+        # wrong rundir\<config>\ folder and fails outright.
+        Invoke-External $Iscc "/DPluginName=${ProductName}" "/DPluginVersion=${ProductVersion}" "/DRundirConfig=${Configuration}" "${ProjectRoot}/installer.iss"
         Log-Group
     }
 }

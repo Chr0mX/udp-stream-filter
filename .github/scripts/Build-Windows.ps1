@@ -79,6 +79,9 @@ function Build {
     Log-Group "Building ${ProductName}..."
     Invoke-External cmake @CmakeBuildArgs
 
+    Log-Group "Running unit tests..."
+    Invoke-External ctest --test-dir "build_${Target}" -C $Configuration --output-on-failure
+
     Log-Group "Installing ${ProductName}..."
     Invoke-External cmake @CmakeInstallArgs
 

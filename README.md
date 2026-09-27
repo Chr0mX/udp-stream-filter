@@ -1,59 +1,81 @@
-# OBS Plugin Template
+# Colour — OBS UDP Stream Filter
 
-## Introduction
+OBS Studio filter that captures a (optionally cropped / downscaled) region of a
+source, JPEG-encodes it on a background thread, and sends it over UDP using a
+chunked wire protocol compatible with Axiom’s `udp_receiver.py`.
 
-The plugin template is meant to be used as a starting point for OBS Studio plugin development. It includes:
+Filter name in OBS: **UDP Stream (Colour)**
 
-* Boilerplate plugin source code
-* A CMake project file
-* GitHub Actions workflows and repository actions
+## Features
 
-## Supported Build Environments
+- Enable/disable streaming without removing the filter
+- Target host as IPv4, IPv6, or hostname (Apply button applies address changes
+  without recreating the socket on every keystroke)
+- Configurable UDP payload size (Wi‑Fi-safe 1200 through LAN 60000)
+- JPEG quality + Max FPS cap (default 120)
+- Crop presets: 160 / 320 / 416 / 512 / 640, or custom size + anchor
+- Optional encode-time downscale after crop
+- Green crop overlay on the OBS preview
+- Measured FPS / bitrate / drop / error stats (Refresh button; also logged
+  every ~5s while streaming)
+- Optional XUDP timestamp trailer after JPEG EOI (backward-compatible with
+  receivers that only `imdecode` the assembled bytes)
 
-| Platform  | Tool   |
-|-----------|--------|
-| Windows   | Visual Studio 17 2022 |
-| macOS     | XCode 16.0 |
-| Windows, macOS  | CMake 3.30.5 |
-| Ubuntu 24.04 | CMake 3.28.3 |
-| Ubuntu 24.04 | `ninja-build` |
-| Ubuntu 24.04 | `pkg-config`
-| Ubuntu 24.04 | `build-essential` |
+## Install (Windows)
 
-## Quick Start
+1. Download the installer from a [release](https://github.com/Chr0mX/udp-stream-filter/releases)
+   or a CI artifact.
+2. Run the installer (installs into
+   `%ProgramData%\obs-studio\plugins\Colour\`).
+3. Restart OBS Studio.
+4. On a source: **Filters → + → UDP Stream (Colour)**.
 
-An absolute bare-bones [Quick Start Guide](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide) is available in the wiki.
+## Typical setup with Axiom
 
-## Documentation
+1. On the receiving machine, start Axiom’s UDP capture on port **5600**.
+2. In the filter: set **Target Host** to that machine’s IP/hostname, port
+   `5600`, click **Apply Target Address**.
+3. Pick a crop preset (or custom crop) matching your detection input size.
+4. Enable **Show Crop Overlay** to position the region on the preview.
+5. Tick **Enable UDP Streaming**.
+6. Use **Refresh Stream Stats** to confirm FPS / bitrate / errors.
 
-All documentation can be found in the [Plugin Template Wiki](https://github.com/obsproject/obs-plugintemplate/wiki).
+## Wire protocol
 
-Suggested reading to get up and running:
+Each UDP datagram:
 
-* [Getting started](https://github.com/obsproject/obs-plugintemplate/wiki/Getting-Started)
-* [Build system requirements](https://github.com/obsproject/obs-plugintemplate/wiki/Build-System-Requirements)
-* [Build system options](https://github.com/obsproject/obs-plugintemplate/wiki/CMake-Build-System-Options)
+| Field | Size | Endian | Meaning |
+|---|---|---|---|
+| `frame_id` | 4 | BE | Increments per source frame |
+| `total_size` | 4 | BE | Total payload bytes across chunks |
+| `chunk_index` | 2 | BE | 0-based chunk index |
+| `total_chunks` | 2 | BE | Chunks in this frame |
+| `chunk_size` | 2 | BE | Payload bytes in this packet |
+| payload | `chunk_size` | — | JPEG bytes (+ optional trailer) |
 
-## GitHub Actions & CI
+Optional **XUDP** trailer (14 bytes) may follow the JPEG EOI inside the
+assembled payload: magic `XUDP`, version `1`, flags `0`, unix-ms timestamp
+(uint64 BE). JPEG decoders stop at EOI, so older receivers remain compatible.
 
-Default GitHub Actions workflows are available for the following repository actions:
+## Build
 
-* `push`: Run for commits or tags pushed to `master` or `main` branches.
-* `pr-pull`: Run when a Pull Request has been pushed or synchronized.
-* `dispatch`: Run when triggered by the workflow dispatch in GitHub's user interface.
-* `build-project`: Builds the actual project and is triggered by other workflows.
-* `check-format`: Checks CMake and plugin source code formatting and is triggered by other workflows.
+See the [OBS Plugin Template wiki](https://github.com/obsproject/obs-plugintemplate/wiki)
+for toolchain setup. This project additionally needs OpenCV (`core`,
+`imgproc`, `imgcodecs` with JPEG):
 
-The workflows make use of GitHub repository actions (contained in `.github/actions`) and build scripts (contained in `.github/scripts`) which are not needed for local development, but might need to be adjusted if additional/different steps are required to build the plugin.
+- **Windows CI / local**: vcpkg manifest (`vcpkg.json`), static triplet
+  `x64-windows-static`
+- **Ubuntu**: `libopencv-dev`
+- **macOS**: Homebrew `opencv`
 
-### Retrieving build artifacts
+```bash
+# Unit tests (no OBS/OpenCV required)
+g++ -std=c++17 -o udp_stream_tests tests/test_udp_stream_util.cpp
+./udp_stream_tests
+```
 
-Successful builds on GitHub Actions will produce build artifacts that can be downloaded for testing. These artifacts are commonly simple archives and will not contain package installers or installation programs.
+## Versioning
 
-### Building a Release
-
-To create a release, an appropriately named tag needs to be pushed to the `main`/`master` branch using semantic versioning (e.g., `12.3.4`, `23.4.5-beta2`). A draft release will be created on the associated repository with generated installer packages or installation programs attached as release artifacts.
-
-## Signing and Notarizing on macOS
-
-Basic concepts of codesigning and notarization on macOS are explained in the correspodning [Wiki article](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS) which has a specific section for the [GitHub Actions setup](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS#setting-up-code-signing-for-github-actions).
+`buildspec.json` `version` is the single source of truth for the plugin DLL,
+archives, and installer. Release tags of the form `1.2.3` overwrite that field
+in CI before packaging.

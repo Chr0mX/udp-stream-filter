@@ -29,7 +29,7 @@
 #endif
 #define PluginDisplayName "Colour"
 #ifndef PluginVersion
-  #define PluginVersion "1.0.8"              ; must match buildspec.json "version"
+  #define PluginVersion "1.0.9"              ; must match buildspec.json "version"
 #endif
 #ifndef RundirConfig
   ; Matches the CMake preset's build configuration for a normal (non-tag)
@@ -56,7 +56,7 @@
 AppId={{B6C3F2B0-7B9E-4B6E-9A2E-1F3C8D4E5A6B}
 AppName={#PluginDisplayName}
 AppVersion={#PluginVersion}
-AppPublisher=Your Name Here
+AppPublisher=Chr0mX
 DefaultDirName={commonappdata}\obs-studio\plugins\{#PluginName}
 DisableDirPage=yes
 DisableProgramGroupPage=yes

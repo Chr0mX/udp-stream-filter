@@ -153,12 +153,8 @@ void encode_thread_func(udp_stream_filter *f)
 		// Huffman optimize pass. OpenCV/vcpkg JPEG on Windows is
 		// typically libjpeg-turbo already.
 		std::vector<int> encode_params = {
-			cv::IMWRITE_JPEG_QUALITY,
-			quality,
-			cv::IMWRITE_JPEG_OPTIMIZE,
-			0,
-			cv::IMWRITE_JPEG_PROGRESSIVE,
-			0,
+			cv::IMWRITE_JPEG_QUALITY,     quality, cv::IMWRITE_JPEG_OPTIMIZE, 0,
+			cv::IMWRITE_JPEG_PROGRESSIVE, 0,
 		};
 
 		if (!cv::imencode(".jpg", frame, jpeg_buf, encode_params) || jpeg_buf.empty()) {

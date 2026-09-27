@@ -65,12 +65,13 @@ set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES MSVC_RUNTIME_LIBRARY "Mul
 # them.
 target_sources(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE src/udp_stream_filter.cpp
-          src/udp_stream_capture.cpp
-          src/udp_stream_net.cpp
-          src/udp_stream_properties.cpp
-          src/udp_stream_filter.h
-          src/udp_stream_util.h
+  PRIVATE
+    src/udp_stream_filter.cpp
+    src/udp_stream_capture.cpp
+    src/udp_stream_net.cpp
+    src/udp_stream_properties.cpp
+    src/udp_stream_filter.h
+    src/udp_stream_util.h
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

@@ -87,7 +87,8 @@ obs_properties_t *udp_stream_get_properties(void *data)
 	obs_properties_add_bool(props, "append_timestamp_trailer", "Append XUDP timestamp trailer (compat)");
 
 	obs_properties_add_text(props, "stream_fps_debug", "Stream Stats", OBS_TEXT_INFO);
-	obs_properties_add_button(props, "refresh_stream_stats", "Refresh Stream Stats", udp_stream_refresh_stats);
+	obs_properties_add_button2(props, "refresh_stream_stats", "Refresh Stream Stats", udp_stream_refresh_stats,
+				   data);
 
 	obs_property_t *preset_list = obs_properties_add_list(props, "output_preset", "Output Preset",
 							      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);

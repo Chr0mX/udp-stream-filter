@@ -112,7 +112,6 @@ static void *udp_stream_create(obs_data_t *settings, obs_source_t *source)
 	f->first_sent = false;
 	f->last_send = std::chrono::steady_clock::now();
 	f->fps_window_start = std::chrono::steady_clock::now();
-	f->last_ui_refresh = std::chrono::steady_clock::now();
 
 	f->enc_running = true;
 	f->enc_thread = std::thread(encode_thread_func, f);

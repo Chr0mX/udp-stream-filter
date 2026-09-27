@@ -35,6 +35,20 @@ static bool udp_stream_preset_modified(obs_properties_t *props, obs_property_t *
 	return true;
 }
 
+// User-initiated rebuild so the measured-FPS info line can update without
+// the encode thread periodically calling obs_source_update_properties()
+// (which steals focus from open text/number fields while streaming).
+static bool udp_stream_refresh_stats(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(property);
+	UNUSED_PARAMETER(data);
+	// Returning true asks OBS to rebuild the properties view; get_properties
+	// will snapshot the latest measured_fps / frames_dropped into the
+	// stream_fps_debug info text.
+	return true;
+}
+
 obs_properties_t *udp_stream_get_properties(void *data)
 {
 	obs_properties_t *props = obs_properties_create();
@@ -45,6 +59,7 @@ obs_properties_t *udp_stream_get_properties(void *data)
 	obs_properties_add_int_slider(props, "jpeg_quality", "JPEG Quality", 1, 100, 1);
 	obs_properties_add_int(props, "max_fps", "Max FPS (0 = uncapped)", 0, 240, 1);
 	obs_properties_add_text(props, "stream_fps_debug", "Current Stream FPS (measured)", OBS_TEXT_INFO);
+	obs_properties_add_button(props, "refresh_stream_stats", "Refresh Stream Stats", udp_stream_refresh_stats);
 
 	obs_property_t *preset_list = obs_properties_add_list(props, "output_preset", "Output Preset",
 							      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -64,9 +79,10 @@ obs_properties_t *udp_stream_get_properties(void *data)
 		obs_data_t *settings = obs_source_get_settings(f->source);
 		udp_stream_preset_modified(props, preset_list, settings);
 
-		// Live status text, refreshed each time the properties are
-		// (re)built -- see the periodic obs_source_update_properties()
-		// call in encode_thread_func() that keeps an open dialog current.
+		// Live status text, filled each time the properties are (re)built
+		// (dialog open, preset change, or the Refresh Stream Stats button).
+		// Intentionally not pushed in from the encode thread -- see the
+		// comment on measured_fps in udp_stream_filter.h.
 		char fps_buf[128];
 		double fps = f->measured_fps.load();
 		uint64_t dropped;

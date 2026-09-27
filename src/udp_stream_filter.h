@@ -157,11 +157,13 @@ struct udp_stream_filter {
 	// Live-measured FPS of frames actually sent over UDP (i.e. what the
 	// receiver sees), independent of the Max FPS cap. Updated by the encode
 	// thread roughly once per second; read from the UI thread when the
-	// filter's properties are (re)built.
+	// filter's properties are (re)built (dialog open / Refresh button).
+	// Intentionally never pushed into an open dialog via
+	// obs_source_update_properties() -- that rebuilds every widget and
+	// steals focus from text/number fields while streaming.
 	std::atomic<double> measured_fps{0.0};
 	std::chrono::steady_clock::time_point fps_window_start;
 	int fps_window_count = 0;
-	std::chrono::steady_clock::time_point last_ui_refresh;
 };
 
 // --- udp_stream_net.cpp ---

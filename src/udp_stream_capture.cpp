@@ -205,11 +205,13 @@ void encode_thread_func(udp_stream_filter *f)
 			send_jpeg_chunked(f, jpeg_buf.data(), (unsigned long)jpeg_buf.size(), frame_id);
 			f->frames_sent++;
 
-			// Recompute the measured send FPS about once per second for
-			// accuracy, but only nudge the UI to refresh every few
-			// seconds -- obs_source_update_properties() rebuilds the
-			// whole Filters properties dialog, which fights typing/
-			// clicking in other fields (e.g. Max FPS) if done too often.
+			// Recompute the measured send FPS about once per second.
+			// Do NOT call obs_source_update_properties() from here:
+			// that rebuilds the entire Filters properties dialog and
+			// steals focus from whatever field the user is typing in
+			// (Target IP, Max FPS, etc.) whenever streaming is on.
+			// The Properties dialog reads measured_fps when it is
+			// opened or when the user hits "Refresh Stream Stats".
 			f->fps_window_count++;
 			auto now = std::chrono::steady_clock::now();
 			double elapsed = std::chrono::duration<double>(now - f->fps_window_start).count();
@@ -217,13 +219,6 @@ void encode_thread_func(udp_stream_filter *f)
 				f->measured_fps = f->fps_window_count / elapsed;
 				f->fps_window_count = 0;
 				f->fps_window_start = now;
-
-				double since_ui_refresh =
-					std::chrono::duration<double>(now - f->last_ui_refresh).count();
-				if (since_ui_refresh >= 4.0) {
-					f->last_ui_refresh = now;
-					obs_source_update_properties(f->source);
-				}
 			}
 		} else {
 			blog(LOG_WARNING, "[xudp] JPEG compression failed");

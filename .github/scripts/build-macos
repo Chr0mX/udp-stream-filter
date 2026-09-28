@@ -140,6 +140,14 @@ build() {
 
   pushd build_macos
   run_xcodebuild ${build_args}
+
+  log_group "Building unit tests..."
+  run_xcodebuild ONLY_ACTIVE_ARCH=NO -arch arm64 -project ${product_name}.xcodeproj \
+    -target udp_stream_tests -destination "generic/platform=macOS,name=Any Mac" \
+    -configuration ${config} -parallelizeTargets -hideShellScriptEnvironment build
+
+  log_group "Running unit tests..."
+  ctest --output-on-failure -C ${config}
   popd
 
   log_group "Installing ${product_name}..."

@@ -1,24 +1,59 @@
 // udp_stream_filter.cpp -- OBS module entry points and the filter's own
-// lifecycle/settings callbacks. The per-frame render path, the socket/wire
-// protocol, and the properties UI now live in their own translation units
-// (udp_stream_capture.cpp / udp_stream_net.cpp / udp_stream_properties.cpp)
-// -- see udp_stream_filter.h for the struct definition and the declarations
-// shared across them.
+// lifecycle/settings callbacks.
 #include "udp_stream_filter.h"
+
+#include <algorithm>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("xudp", "en-US")
 
 static void udp_stream_update(void *data, obs_data_t *settings);
 
-// ---------------------------------------------------------------------------
-// OBS filter callbacks
-// ---------------------------------------------------------------------------
+void draw_crop_overlay(float x, float y, float w, float h, float src_w, float src_h)
+{
+	if (w <= 0.0f || h <= 0.0f || src_w <= 0.0f || src_h <= 0.0f)
+		return;
+
+	gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+	if (!solid)
+		return;
+
+	gs_eparam_t *color_param = gs_effect_get_param_by_name(solid, "color");
+	struct vec4 color;
+	vec4_set(&color, 0.15f, 0.95f, 0.25f, 0.9f);
+	gs_effect_set_vec4(color_param, &color);
+
+	const float t = std::max(2.0f, std::min(src_w, src_h) * 0.004f);
+
+	gs_projection_push();
+	gs_ortho(0.0f, src_w, 0.0f, src_h, -100.0f, 100.0f);
+	gs_matrix_push();
+	gs_matrix_identity();
+
+	auto draw_bar = [&](float bx, float by, float bw, float bh) {
+		if (bw <= 0.0f || bh <= 0.0f)
+			return;
+		gs_matrix_push();
+		gs_matrix_translate3f(bx, by, 0.0f);
+		gs_matrix_scale3f(bw, bh, 1.0f);
+		while (gs_effect_loop(solid, "Solid"))
+			gs_draw_sprite(nullptr, 0, 1, 1);
+		gs_matrix_pop();
+	};
+
+	draw_bar(x, y, w, t);
+	draw_bar(x, y + h - t, w, t);
+	draw_bar(x, y, t, h);
+	draw_bar(x + w - t, y, t, h);
+
+	gs_matrix_pop();
+	gs_projection_pop();
+}
 
 static const char *udp_stream_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
-	return "Colour";
+	return "UDP Stream (Colour)";
 }
 
 static void udp_stream_video_render(void *data, gs_effect_t *effect)
@@ -28,71 +63,61 @@ static void udp_stream_video_render(void *data, gs_effect_t *effect)
 
 	obs_source_t *target = obs_filter_get_target(f->source);
 
-	// Snapshot udp_enabled/max_fps under net_mtx instead of reading
-	// f->udp_enabled/f->max_fps directly -- both are written by
-	// udp_stream_update() (the settings-update callback) as part of one
-	// locked group, and this render-thread read must join that same
-	// group instead of racing it. See udp_stream_filter.h's comment on
-	// the settings block.
 	bool udp_enabled;
 	int max_fps;
+	bool show_overlay;
+	bool crop_enabled;
+	int crop_width, crop_height, crop_anchor_x, crop_anchor_y;
 	{
 		std::lock_guard<std::mutex> net_lock(f->net_mtx);
 		udp_enabled = f->udp_enabled;
 		max_fps = f->max_fps;
+		show_overlay = f->show_crop_overlay;
+		crop_enabled = f->crop_enabled;
+		crop_width = f->crop_width;
+		crop_height = f->crop_height;
+		crop_anchor_x = f->crop_anchor_x;
+		crop_anchor_y = f->crop_anchor_y;
 	}
 
-	if (!target || !udp_enabled) {
-		obs_source_skip_video_filter(f->source);
-		return;
-	}
+	uint32_t width = target ? obs_source_get_base_width(target) : 0;
+	uint32_t height = target ? obs_source_get_base_height(target) : 0;
 
-	uint32_t width = obs_source_get_base_width(target);
-	uint32_t height = obs_source_get_base_height(target);
+	if (target && udp_enabled && width > 0 && height > 0) {
+		bool should_capture = true;
 
-	if (width == 0 || height == 0) {
-		obs_source_skip_video_filter(f->source);
-		return;
-	}
+		if (max_fps > 0) {
+			auto now = std::chrono::steady_clock::now();
+			auto min_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+				std::chrono::duration<double>(1.0 / (double)max_fps));
 
-	bool should_capture = true;
-
-	if (max_fps > 0) {
-		auto now = std::chrono::steady_clock::now();
-		auto min_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-			std::chrono::duration<double>(1.0 / (double)max_fps));
-
-		if (!f->first_sent) {
-			f->last_send = now;
-			f->first_sent = true;
-		} else if (now - f->last_send < min_interval) {
-			should_capture = false;
-		} else {
-			// Advance the schedule by exactly one interval (banking any
-			// leftover time) instead of snapping to "now". Snapping to
-			// "now" always floors the achievable rate to an exact integer
-			// divisor of the render callback's tick rate (e.g. requesting
-			// 140fps against a 240Hz render loop always lands on 120,
-			// never 140) because it throws away the fractional progress
-			// made toward the next frame. Banking it lets the gate "catch
-			// up" over multiple ticks so the long-run average converges
-			// on the actual requested max_fps.
-			f->last_send += min_interval;
-
-			// If we've fallen far behind (e.g. after a stall/hitch),
-			// don't let the bank grow unbounded -- that would fire a
-			// burst of back-to-back catch-up frames. Clamp to at most
-			// one interval behind now.
-			if (now - f->last_send > min_interval)
-				f->last_send = now - min_interval;
+			if (!f->first_sent) {
+				f->last_send = now;
+				f->first_sent = true;
+			} else if (now - f->last_send < min_interval) {
+				should_capture = false;
+			} else {
+				f->last_send += min_interval;
+				if (now - f->last_send > min_interval)
+					f->last_send = now - min_interval;
+			}
 		}
+
+		if (should_capture)
+			capture_and_queue_frame(f, target, width, height);
 	}
 
-	if (should_capture)
-		capture_and_queue_frame(f, target, width, height);
+	// Crop overlay is drawn onto the preview/program output so anchors are
+	// visible without guessing. Independent of whether streaming is on.
+	if (target && show_overlay && crop_enabled && width > 0 && height > 0) {
+		obs_source_video_render(target);
+		CaptureRect rect = compute_capture_rect((int)width, (int)height, true, crop_width, crop_height,
+							crop_anchor_x, crop_anchor_y);
+		draw_crop_overlay((float)rect.x, (float)rect.y, (float)rect.width, (float)rect.height, (float)width,
+				  (float)height);
+		return;
+	}
 
-	// This filter never modifies the displayed/output video; it only taps a
-	// copy of it for streaming. Pass the original render straight through.
 	obs_source_skip_video_filter(f->source);
 }
 
@@ -108,11 +133,18 @@ static void *udp_stream_create(obs_data_t *settings, obs_source_t *source)
 	f->stage_valid[0] = f->stage_valid[1] = false;
 	f->stage_write_idx = 0;
 	f->sock = INVALID_SOCKET;
+	f->addr_len = 0;
+	f->applied_port = 0;
 	f->frames_sent = 0;
 	f->first_sent = false;
 	f->last_send = std::chrono::steady_clock::now();
 	f->fps_window_start = std::chrono::steady_clock::now();
-	f->last_ui_refresh = std::chrono::steady_clock::now();
+	f->last_status_log = std::chrono::steady_clock::now();
+	f->pending_count = 0;
+	f->udp_payload_size = 1400;
+	f->downscale_to = 0;
+	f->show_crop_overlay = true;
+	f->append_timestamp_trailer = true;
 
 	f->enc_running = true;
 	f->enc_thread = std::thread(encode_thread_func, f);
@@ -150,16 +182,6 @@ static void udp_stream_update(void *data, obs_data_t *settings)
 {
 	udp_stream_filter *f = (udp_stream_filter *)data;
 
-	// Read every setting into a local first -- none of this needs a lock,
-	// it's just obs_data_t access -- then take net_mtx exactly once below
-	// to publish the whole group atomically. This replaces the previous
-	// field-by-field unlocked writes (with only jpeg_quality individually
-	// guarded): the render thread reads several of these fields every
-	// frame (see udp_stream_video_render()/capture_and_queue_frame()), so
-	// writing them unlocked was a real, if practically benign on x86/x64,
-	// data race -- and the five crop-rect fields specifically must change
-	// together as one group or a reader can observe a torn mix of old and
-	// new values.
 	bool new_udp_enabled = obs_data_get_bool(settings, "udp_enabled");
 	std::string new_ip = obs_data_get_string(settings, "target_ip");
 	int new_port = (int)obs_data_get_int(settings, "target_port");
@@ -168,15 +190,17 @@ static void udp_stream_update(void *data, obs_data_t *settings)
 	int new_crop_anchor_x = (int)obs_data_get_int(settings, "crop_anchor_x");
 	int new_crop_anchor_y = (int)obs_data_get_int(settings, "crop_anchor_y");
 	int new_output_preset = (int)obs_data_get_int(settings, "output_preset");
+	int new_downscale_to = (int)obs_data_get_int(settings, "downscale_to");
+	int new_payload = (int)obs_data_get_int(settings, "udp_payload_size");
+	bool new_show_overlay = obs_data_get_bool(settings, "show_crop_overlay");
+	bool new_append_trailer = obs_data_get_bool(settings, "append_timestamp_trailer");
 
-	int preset_size = new_output_preset == 1 ? 320 : new_output_preset == 2 ? 640 : 0;
+	int preset_size = preset_crop_size(new_output_preset);
 
 	bool new_crop_enabled;
 	int new_crop_width;
 	int new_crop_height;
 	if (preset_size > 0) {
-		// Presets force a native square crop at the given size; the
-		// anchor remains user-adjustable (defaults to center).
 		new_crop_enabled = true;
 		new_crop_width = preset_size;
 		new_crop_height = preset_size;
@@ -186,13 +210,9 @@ static void udp_stream_update(void *data, obs_data_t *settings)
 		new_crop_height = (int)obs_data_get_int(settings, "crop_height");
 	}
 
-	// Everything from here down is one locked group: the settings fields
-	// themselves, plus the socket lifecycle (which depends on whether
-	// udp_enabled/target_ip/target_port changed) -- the encode thread may
-	// be inside send_jpeg_chunked() on the old socket/address right now,
-	// so both the field writes and the socket teardown/setup need to be
-	// atomic with respect to it.
 	std::lock_guard<std::mutex> net_lock(f->net_mtx);
+
+	const bool was_enabled = f->udp_enabled;
 
 	f->udp_enabled = new_udp_enabled;
 	f->jpeg_quality = new_jpeg_quality;
@@ -203,22 +223,27 @@ static void udp_stream_update(void *data, obs_data_t *settings)
 	f->crop_enabled = new_crop_enabled;
 	f->crop_width = new_crop_width;
 	f->crop_height = new_crop_height;
+	f->downscale_to = new_downscale_to > 0 ? new_downscale_to : 0;
+	f->udp_payload_size = (int)clamp_udp_payload(new_payload);
+	f->show_crop_overlay = new_show_overlay;
+	f->append_timestamp_trailer = new_append_trailer;
 
-	bool ip_or_port_changed = (new_ip != f->target_ip) || (new_port != f->target_port);
+	// Always keep the typed host/port on the struct (for Apply + stats),
+	// but do NOT recreate the socket on every keystroke -- that was racing
+	// the encode thread and briefly interrupting the stream while typing.
 	f->target_ip = new_ip;
 	f->target_port = new_port;
 
-	if (f->udp_enabled && (f->sock == INVALID_SOCKET || ip_or_port_changed)) {
-		setup_socket_locked(f);
-	} else if (!f->udp_enabled && f->sock != INVALID_SOCKET) {
+	if (f->udp_enabled) {
+		// Create/rebuild only when streaming is turned on (or was on
+		// but never successfully bound). Host edits require Apply.
+		if (!was_enabled || f->sock == INVALID_SOCKET)
+			setup_socket_locked(f);
+	} else if (f->sock != INVALID_SOCKET) {
 		closesocket(f->sock);
 		f->sock = INVALID_SOCKET;
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Module entry points
-// ---------------------------------------------------------------------------
 
 #ifdef _WIN32
 static bool g_wsa_started = false;

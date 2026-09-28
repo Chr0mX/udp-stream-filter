@@ -65,11 +65,22 @@ set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES MSVC_RUNTIME_LIBRARY "Mul
 # them.
 target_sources(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE src/udp_stream_filter.cpp
-          src/udp_stream_capture.cpp
-          src/udp_stream_net.cpp
-          src/udp_stream_properties.cpp
-          src/udp_stream_filter.h
+  PRIVATE
+    src/udp_stream_filter.cpp
+    src/udp_stream_capture.cpp
+    src/udp_stream_net.cpp
+    src/udp_stream_properties.cpp
+    src/udp_stream_filter.h
+    src/udp_stream_util.h
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+# Pure unit tests for crop/header/trailer helpers (no OBS/OpenCV linkage).
+option(ENABLE_UDP_STREAM_TESTS "Build udp_stream_util unit tests" ON)
+if(ENABLE_UDP_STREAM_TESTS)
+  enable_testing()
+  add_executable(udp_stream_tests tests/test_udp_stream_util.cpp)
+  target_include_directories(udp_stream_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  add_test(NAME udp_stream_tests COMMAND udp_stream_tests)
+endif()

@@ -220,6 +220,9 @@ ${_usage_host:-}"
 
     log_group "Building ${product_name}..."
     cmake ${cmake_build_args}
+
+    log_group "Running unit tests..."
+    ctest --test-dir "build_${target##*-}" --output-on-failure
   }
 
   log_group "Installing ${product_name}..."

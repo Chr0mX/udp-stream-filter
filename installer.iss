@@ -29,7 +29,7 @@
 #endif
 #define PluginDisplayName "Colour"
 #ifndef PluginVersion
-  #define PluginVersion "1.0.9"              ; must match buildspec.json "version"
+  #define PluginVersion "1.1.0"              ; must match buildspec.json "version"
 #endif
 #ifndef RundirConfig
   ; Matches the CMake preset's build configuration for a normal (non-tag)

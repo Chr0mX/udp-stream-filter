@@ -1,9 +1,14 @@
 ; Inno Setup script for the UDP Stream Output OBS plugin.
 ;
 ; Installs into OBS Studio's per-machine additional-plugins directory
-; (%ProgramData%\obs-studio\plugins\<name>\), which OBS Studio (v28+) scans
+; (%ProgramData%\obs-studio\plugins\<name>\), which OBS Studio scans
 ; automatically on startup. This means the installer does NOT need to
 ; locate the user's actual OBS Studio install directory at all.
+;
+; Layout (current OBS format; bin\64bit is the deprecated "legacy" layout):
+;   %ProgramData%\obs-studio\plugins\<name>\<name>.dll
+;   %ProgramData%\obs-studio\plugins\<name>\data\*
+; See https://obsproject.com/kb/legacy-plugin-developer-info
 ;
 ; Place this file at the root of the plugin project (same level as
 ; build_x64\), or adjust SourceRundir below to match wherever you put it.
@@ -29,7 +34,7 @@
 #endif
 #define PluginDisplayName "Colour"
 #ifndef PluginVersion
-  #define PluginVersion "1.1.0"              ; must match buildspec.json "version"
+  #define PluginVersion "1.2.0"              ; must match buildspec.json "version"
 #endif
 #ifndef RundirConfig
   ; Matches the CMake preset's build configuration for a normal (non-tag)
@@ -73,17 +78,26 @@ WizardStyle=modern
 
 [Files]
 Source: "{#SourceRundir}\{#PluginName}.dll"; \
-    DestDir: "{commonappdata}\obs-studio\plugins\{#PluginName}\bin\64bit"; \
+    DestDir: "{commonappdata}\obs-studio\plugins\{#PluginName}"; \
     Flags: ignoreversion
 
 Source: "{#SourceRundir}\{#PluginName}.pdb"; \
-    DestDir: "{commonappdata}\obs-studio\plugins\{#PluginName}\bin\64bit"; \
+    DestDir: "{commonappdata}\obs-studio\plugins\{#PluginName}"; \
     Flags: ignoreversion skipifsourcedoesntexist
 
 Source: "{#SourceRundir}\{#PluginName}\*"; \
     DestDir: "{commonappdata}\obs-studio\plugins\{#PluginName}\data"; \
     Flags: ignoreversion recursesubdirs createallsubdirs; \
     Check: DirExists(ExpandConstant('{#SourceRundir}\{#PluginName}'))
+
+[InstallDelete]
+; Remove files from previous (legacy) layouts so OBS doesn't see duplicates.
+; ProgramData legacy: ...\plugins\<name>\bin\64bit\<name>.dll
+Type: filesandordirs; Name: "{commonappdata}\obs-studio\plugins\{#PluginName}\bin"
+; Program Files legacy (not loaded from OBS 34.0 onwards)
+Type: files; Name: "{autopf}\obs-studio\obs-plugins\64bit\{#PluginName}.dll"
+Type: files; Name: "{autopf}\obs-studio\obs-plugins\64bit\{#PluginName}.pdb"
+Type: filesandordirs; Name: "{autopf}\obs-studio\data\obs-plugins\{#PluginName}"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{commonappdata}\obs-studio\plugins\{#PluginName}"

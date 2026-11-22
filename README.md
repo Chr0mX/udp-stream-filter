@@ -26,9 +26,15 @@ Filter name in OBS: **UDP Stream (Colour)**
 1. Download the installer from a [release](https://github.com/Chr0mX/udp-stream-filter/releases)
    or a CI artifact.
 2. Run the installer (installs into
-   `%ProgramData%\obs-studio\plugins\Colour\`).
+   `%ProgramData%\obs-studio\plugins\Colour\`, with `Colour.dll` directly in
+   that folder and resources in `data\` — the current OBS plugin layout; the
+   old `bin\64bit` layout is flagged Legacy by newer OBS versions. The
+   installer also removes files from older layouts.)
 3. Restart OBS Studio.
 4. On a source: **Filters → + → UDP Stream (Colour)**.
+
+Portable OBS installs ignore ProgramData; copy the same `Colour` folder to
+`<obs root>\plugins\Colour\` (containing `Colour.dll` and `data\`).
 
 ## Typical setup with Axiom
 
